@@ -174,7 +174,7 @@ $(document).ready(function(){
             $('.icon-search').css('color', '#CAD3DC');
         }
 
-        $.getJSON('../../search.json').done(function(data) {
+        $.getJSON('blog/search.json').done(function(data) {
             var html = '';
             for (var i in data) {
                 var item = data[i];
