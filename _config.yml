@@ -5,7 +5,7 @@ keyword: '汪玉泉, 汪玉泉的博客, 后端'
 url: '' # your host
 
 # if you don't need baseurl, you should leave this value blank.
-baseurl: ''
+baseurl: '/blog'
 
 # Navigation links
 nav:
@@ -20,7 +20,7 @@ footer:
 author: '汪玉泉'
 nickname: 'yuquan'
 bio: '后端开发者'
-avatar: 'assets/img/profile.png'
+avatar: '/assets/img/profile.png'
 
 # Search
 search: true
