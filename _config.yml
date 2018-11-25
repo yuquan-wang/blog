@@ -2,7 +2,7 @@
 title: '汪小泉的博客'
 description: 'Software engineer in Indeed tokyo。'
 keyword: '汪玉泉, 汪玉泉的博客, 后端'
-url: '' # your host
+url: 'https://yuquan-wang.github.io' # your host
 
 # if you don't need baseurl, you should leave this value blank.
 baseurl: '/blog'
@@ -23,7 +23,7 @@ bio: 'Software engineer in Indeed tokyo'
 avatar: '/assets/img/profile.png'
 
 # Search
-search: false
+search: true
 
 # Night mode
 nightMode: true
