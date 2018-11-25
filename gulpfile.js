@@ -8,7 +8,7 @@ gulp.task('scripts', function(){
     gulp.src('dev/js/index.js')
         .pipe(uglify())
         .pipe(rename({suffix: '.min'}))
-        .pipe(gulp.dest('assets/js'))
+        .pipe(gulp.dest('{{ site.baseurl }}/assets/js'))
 });
 
 gulp.task('sass', function(){
@@ -17,7 +17,7 @@ gulp.task('sass', function(){
         .pipe(gulp.dest('dev/sass'))
         .pipe(cleanCSS())
         .pipe(rename({suffix: '.min'}))
-        .pipe(gulp.dest('assets/css'));
+        .pipe(gulp.dest('{{ site.baseurl }}/assets/css'));
 });
 
 gulp.task('watch', function(){
