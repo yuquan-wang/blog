@@ -20,7 +20,7 @@ footer:
 author: '汪玉泉'
 nickname: 'yuquan'
 bio: '后端开发者'
-avatar: '/assets/img/profile.png'
+avatar: 'assets/img/profile.png'
 
 # Search
 search: true

@@ -13,13 +13,13 @@ categories: 哈希
 
 通过以下的一张图可以简单明了的表达这种思想：(图来自网上他人博客)
 
-![png1](/assets/img/consistent-hash/1.png){: .center-image }
+![png1](assets/img/consistent-hash/1.png){: .center-image }
 
 蓝色的点是我们的存储节点，橘黄色的点则是我们的数据，可以看到，他们在执行hash函数后，分别被放在0-2^32的这个环形空间内，故可以按照箭头的放下，把数据存储在相应的存储节点，即k1,k2的数据存储到节点B上，而k3,k4的数据存储到节点C上
 
 存储节点的删除：假设存储节点B因为故障挂了，结果如下图所示
 
-![png2](/assets/img/consistent-hash/2.png){: .center-image }
+![png2](assets/img/consistent-hash/2.png){: .center-image }
 
 则k1,k2的数据按照算法会被移动到存储节点C上，值得注意的是，并不影响节点A，D的数据和本应该存储在C的数据，而是仅仅把应该存储在B上的数据转移到了C上，可以看到代价是比较小的
 
@@ -29,6 +29,6 @@ categories: 哈希
 
 在上述例子中，假设节点B挂了，那么k1,k2,k3,k4都会存储到节点C上，这样就造成了负载不均衡，明明A和D负载很少，为什么新数据要全部压在C身上？故此引入了虚拟节点，即一台机器当成好几台机器来用，比如将自己的存储空间划分成两个空间，一个当成A1,另一个当成A2，经过hash之后，再换上尽量离的远一点，示意图如下图所示：
 
-![png3](/assets/img/consistent-hash/3.png){: .center-image }
+![png3](assets/img/consistent-hash/3.png){: .center-image }
 
 这样的话就算一个节点A挂了，A1的数据会被存到C2上面，A2的数据会被存储到D1上面，从而达到了负载均衡。
