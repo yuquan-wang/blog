@@ -1,0 +1,310 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(4)-服务端通信1"
+date:   2018-12-27 11:49:45 +0200
+categories: ZooKeeper 源码
+---
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
+
+本文接着上篇博客来探索一下服务端是如何进行通信的，从NIOServerCnxnFactory的start函数开始：
+{% highlight java %}
+public void start() {
+        // other code
+        for(SelectorThread thread : selectorThreads) {
+            if (thread.getState() == Thread.State.NEW) {
+                thread.start();
+            }
+        }
+        // ensure thread is started once and only once
+        if (acceptThread.getState() == Thread.State.NEW) {
+            acceptThread.start();
+        }
+        // other code
+    }
+{% endhighlight %}
+可以看到，服务端是只有一个accept线程的，然后有多个selector线程，这些线程都会被启动，我们首先来看accept线程的主要代码：
+{% highlight java %}
+private class AcceptThread extends AbstractSelectThread {
+        private final ServerSocketChannel acceptSocket;
+        private final SelectionKey acceptKey;
+        private final RateLogger acceptErrorLogger = new RateLogger(LOG);
+        private final Collection<SelectorThread> selectorThreads;
+        private Iterator<SelectorThread> selectorIterator;
+        private volatile boolean reconfiguring = false;
+
+        public AcceptThread(ServerSocketChannel ss, InetSocketAddress addr,
+                            Set<SelectorThread> selectorThreads) throws IOException {
+            super("NIOServerCxnFactory.AcceptThread:" + addr);
+            this.acceptSocket = ss;
+            this.acceptKey =
+                    acceptSocket.register(selector, SelectionKey.OP_ACCEPT);
+            this.selectorThreads = Collections.unmodifiableList(
+                    new ArrayList<SelectorThread>(selectorThreads));
+            selectorIterator = this.selectorThreads.iterator();
+        }
+    }
+{% endhighlight %}
+以上是该类的主要成员变量和构造函数，需要指出的是，构造函数中最重要的就是把该acceptThread和多个selectorThread关联起来，这样才能再之后accept一个连接的时候，把它交给selector线程处理。
+来看该线程的run()函数：
+{% highlight java %}
+public void run() {
+            try {
+                while (!stopped && !acceptSocket.socket().isClosed()) {
+                    try {
+                        select();
+                    } catch (RuntimeException e) {
+                        LOG.warn("Ignoring unexpected runtime exception", e);
+                    } catch (Exception e) {
+                        LOG.warn("Ignoring unexpected exception", e);
+                    }
+                }
+            } finally {
+                closeSelector();
+                // This will wake up the selector threads, and tell the
+                // worker thread pool to begin shutdown.
+            	if (!reconfiguring) {                    
+                    NIOServerCnxnFactory.this.stop();
+                }
+                LOG.info("accept thread exitted run method");
+            }
+        }
+{% endhighlight %}
+可以看到，该run()函数中是个死循环，只要还没结束，socket还没关闭，就会不断的调用select()函数，来看看在select()函数中做了些什么：
+{% highlight java %}
+private void select() {
+            try {
+                selector.select();
+
+                Iterator<SelectionKey> selectedKeys =
+                    selector.selectedKeys().iterator();
+                while (!stopped && selectedKeys.hasNext()) {
+                    SelectionKey key = selectedKeys.next();
+                    selectedKeys.remove();
+
+                    if (!key.isValid()) {
+                        continue;
+                    }
+                    if (key.isAcceptable()) {
+                        if (!doAccept()) {
+                            // If unable to pull a new connection off the accept
+                            // queue, pause accepting to give us time to free
+                            // up file descriptors and so the accept thread
+                            // doesn't spin in a tight loop.
+                            pauseAccept(10);
+                        }
+                    } else {
+                        LOG.warn("Unexpected ops in accept select "
+                                 + key.readyOps());
+                    }
+                }
+            } catch (IOException e) {
+                LOG.warn("Ignoring IOException while selecting", e);
+            }
+        }
+{% endhighlight %}
+可以看到，里面最主要的代码便是遍历所有connectionkey, 如果有可以accept的连接，则进行accept, doAccept()函数便是关键：
+{% highlight java %}
+private boolean doAccept() {
+            boolean accepted = false;
+            SocketChannel sc = null;
+            try {
+                sc = acceptSocket.accept();
+                accepted = true;
+                InetAddress ia = sc.socket().getInetAddress();
+                int cnxncount = getClientCnxnCount(ia);
+
+                if (maxClientCnxns > 0 && cnxncount >= maxClientCnxns){
+                    throw new IOException("Too many connections from " + ia
+                                          + " - max is " + maxClientCnxns );
+                }
+
+                LOG.info("Accepted socket connection from "
+                         + sc.socket().getRemoteSocketAddress());
+                sc.configureBlocking(false);
+
+                // Round-robin assign this connection to a selector thread
+                if (!selectorIterator.hasNext()) {
+                    selectorIterator = selectorThreads.iterator();
+                }
+                SelectorThread selectorThread = selectorIterator.next();
+                if (!selectorThread.addAcceptedConnection(sc)) {
+                    throw new IOException(
+                        "Unable to add connection to selector queue"
+                        + (stopped ? " (shutdown in progress)" : ""));
+                }
+                acceptErrorLogger.flush();
+            } catch (IOException e) {
+                // accept, maxClientCnxns, configureBlocking
+                acceptErrorLogger.rateLimitLog(
+                    "Error accepting new connection: " + e.getMessage());
+                fastCloseSock(sc);
+            }
+            return accepted;
+        }
+{% endhighlight %}
+在该函数中，主要是调用acceptSocket.accept()来进行连接的accept,然后选择一个可用的selectorThread,通过selectorThread.addAcceptedConnection(sc)将该连接与selectorThread连接起来，以上便是acceptThread主要干的事情了。
+
+接下来来看selectorThread的源码：
+{% highlight java %}
+class SelectorThread extends AbstractSelectThread {
+    private final int id;
+    private final Queue<SocketChannel> acceptedQueue;
+    private final Queue<SelectionKey> updateQueue;
+
+    public SelectorThread(int id) throws IOException {
+        super("NIOServerCxnFactory.SelectorThread-" + id);
+        this.id = id;
+        acceptedQueue = new LinkedBlockingQueue<SocketChannel>();
+        updateQueue = new LinkedBlockingQueue<SelectionKey>();
+    }
+}
+{% endhighlight %}
+该来主要有两个重要的Queue,分别为acceptedQueue和updateQueue,前者为刚刚accept还没进行过处理的channel，后者则是所有待处理的selectionKey. 之后的源码会具体介绍各自的作用。
+
+首先来看线程主要的run()函数，以下是精简版的代码：
+{% highlight java %}
+public void run() {
+    try {
+        while (!stopped) {
+            try {
+                select();
+                processAcceptedConnections();
+                processInterestOpsUpdateRequests();
+            } catch (RuntimeException e) {
+                LOG.warn("Ignoring unexpected runtime exception", e);
+            } catch (Exception e) {
+                LOG.warn("Ignoring unexpected exception", e);
+            }
+        }
+    }
+}
+{% endhighlight %}
+只要该线程没结束，就一直在循环地跑上面try里的三个函数，让我们一一来看，首先是select()函数：
+{% highlight java %}
+private void select() {
+            try {
+                selector.select();
+
+                Set<SelectionKey> selected = selector.selectedKeys();
+                ArrayList<SelectionKey> selectedList =
+                    new ArrayList<SelectionKey>(selected);
+                Collections.shuffle(selectedList);
+                Iterator<SelectionKey> selectedKeys = selectedList.iterator();
+                while(!stopped && selectedKeys.hasNext()) {
+                    SelectionKey key = selectedKeys.next();
+                    selected.remove(key);
+
+                    if (!key.isValid()) {
+                        cleanupSelectionKey(key);
+                        continue;
+                    }
+                    if (key.isReadable() || key.isWritable()) {
+                        handleIO(key);
+                    } else {
+                        LOG.warn("Unexpected ops in select " + key.readyOps());
+                    }
+                }
+            } catch (IOException e) {
+                LOG.warn("Ignoring IOException while selecting", e);
+            }
+        }
+{% endhighlight %}
+该函数的主要作用就在于，遍历所有selected key, 如果这个key是可写或者可读的，就调用handleIO(key)函数：
+{% highlight java %}
+private void handleIO(SelectionKey key) {
+            IOWorkRequest workRequest = new IOWorkRequest(this, key);
+            NIOServerCnxn cnxn = (NIOServerCnxn) key.attachment();
+
+            // Stop selecting this key while processing on its
+            // connection
+            cnxn.disableSelectable();
+            key.interestOps(0);
+            touchCnxn(cnxn);
+            workerPool.schedule(workRequest);
+        }
+{% endhighlight %}
+而handleIO则是构造一个请求，用workerPool来处理这个请求，最后真正调用的函数为：
+{% highlight java %}
+public void doWork() throws InterruptedException {
+            if (!key.isValid()) {
+                selectorThread.cleanupSelectionKey(key);
+                return;
+            }
+
+            if (key.isReadable() || key.isWritable()) {
+                cnxn.doIO(key);
+
+                // Check if we shutdown or doIO() closed this connection
+                if (stopped) {
+                    cnxn.close();
+                    return;
+                }
+                if (!key.isValid()) {
+                    selectorThread.cleanupSelectionKey(key);
+                    return;
+                }
+                touchCnxn(cnxn);
+            }
+
+            // Mark this connection as once again ready for selection
+            cnxn.enableSelectable();
+            // Push an update request on the queue to resume selecting
+            // on the current set of interest ops, which may have changed
+            // as a result of the I/O operations we just performed.
+            if (!selectorThread.addInterestOpsUpdateRequest(key)) {
+                cnxn.close();
+            }
+        }
+{% endhighlight %}
+上面的逻辑是和之前是类似的，又做了一遍检查，如果是可写或者可读，则调用cnxn的doIO函数，该函数留到下一篇博客再细讲，处理完之后，则会调用selectorThread.addInterestOpsUpdateRequest(key)将该key再次加入updateQueue。
+
+然后来看processAcceptedConnections()函数：
+{% highlight java %}
+private void processAcceptedConnections() {
+            SocketChannel accepted;
+            while (!stopped && (accepted = acceptedQueue.poll()) != null) {
+                SelectionKey key = null;
+                try {
+                    key = accepted.register(selector, SelectionKey.OP_READ);
+                    NIOServerCnxn cnxn = createConnection(accepted, key, this);
+                    key.attach(cnxn);
+                    addCnxn(cnxn);
+                } catch (IOException e) {
+                    // register, createConnection
+                    cleanupSelectionKey(key);
+                    fastCloseSock(accepted);
+                }
+            }
+        }
+{% endhighlight %}
+该函数便是遍历acceptedQueue来得到所有未经处理的连接，然后将这些连接和selector绑定起来（关注SelectionKey.OP_READ），这样之后如果这些连接可读的时候，便通过selector.select()可以知道相应情况。
+
+最后我们来看processInterestOpsUpdateRequests()函数：
+{% highlight java %}
+/**
+ * Iterate over the queue of connections ready to resume selection,
+ * and restore their interest ops selection mask.
+ */
+private void processInterestOpsUpdateRequests() {
+ SelectionKey key;
+ while (!stopped && (key = updateQueue.poll()) != null) {
+  if (!key.isValid()) {
+   cleanupSelectionKey(key);
+  }
+  NIOServerCnxn cnxn = (NIOServerCnxn) key.attachment();
+  if (cnxn.isSelectable()) {
+   key.interestOps(cnxn.getInterestOps());
+  }
+ }
+}
+{% endhighlight %}
+如同注释所示，该函数主要是遍历所有在updateQueue里的key,根据key所绑定的连接的相应情况，重新设置感兴趣的事件，之所以要这样做，是因为在上面的handleIO函数中，在处理IO的时候，我们有如下代码把感兴趣的事件给抹除了：
+{% highlight java %}
+// Stop selecting this key while processing on its connection
+cnxn.disableSelectable();
+key.interestOps(0);
+{% endhighlight %}
+本文主要关注如果接受新的连接，以及如何处理连接的大致框架
+下一篇主要探索NIOServerCnxn的doIO函数，该函数是真正的和客户端交流，接受与发送信息

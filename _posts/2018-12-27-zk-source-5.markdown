@@ -1,0 +1,345 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(5)-服务端通信2"
+date:   2018-12-27 12:49:45 +0200
+categories: ZooKeeper 源码
+---
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
+
+本文接上篇博客来接着探索NIOServerCnxn的doIO函数，该函数做真正的数据传输。
+{% highlight java %}
+void doIO(SelectionKey k) throws InterruptedException {
+    try {
+        if (isSocketOpen() == false) {
+            LOG.warn("trying to do i/o on a null socket for session:0x"
+                     + Long.toHexString(sessionId));
+
+            return;
+        }
+        if (k.isReadable()) {
+            int rc = sock.read(incomingBuffer);
+            if (rc < 0) {
+                throw new EndOfStreamException(
+                        "Unable to read additional data from client sessionid 0x"
+                        + Long.toHexString(sessionId)
+                        + ", likely client has closed socket");
+            }
+            if (incomingBuffer.remaining() == 0) {
+                boolean isPayload;
+                if (incomingBuffer == lenBuffer) { // start of next request
+                    incomingBuffer.flip();
+                    isPayload = readLength(k);
+                    incomingBuffer.clear();
+                } else {
+                    // continuation
+                    isPayload = true;
+                }
+                if (isPayload) { // not the case for 4letterword
+                    readPayload();
+                }
+                else {
+                    // four letter words take care
+                    // need not do anything else
+                    return;
+                }
+            }
+        }
+        if (k.isWritable()) {
+            handleWrite(k);
+
+            if (!initialized && !getReadInterest() && !getWriteInterest()) {
+                throw new CloseRequestException("responded to info probe");
+            }
+        }
+    }
+    //catch all kinds of exception
+{% endhighlight %}
+可以看到，该函数主要分为两大块，当这个Key为可读的时候，则读取request，当为可写的时候，则条用handleWrite,本文也主要分析这两块逻辑。
+首先主要来看读取request.
+{% highlight java %}
+private final ByteBuffer lenBuffer = ByteBuffer.allocate(4);
+private ByteBuffer incomingBuffer = lenBuffer;
+
+if (k.isReadable()) {
+                int rc = sock.read(incomingBuffer);
+                if (rc < 0) {
+                    throw new EndOfStreamException(
+                            "Unable to read additional data from client sessionid 0x"
+                            + Long.toHexString(sessionId)
+                            + ", likely client has closed socket");
+                }
+                if (incomingBuffer.remaining() == 0) {
+                    boolean isPayload;
+                    if (incomingBuffer == lenBuffer) { // start of next request
+                        incomingBuffer.flip();
+                        isPayload = readLength(k);
+                        incomingBuffer.clear();
+                    } else {
+                        // continuation
+                        isPayload = true;
+                    }
+                    if (isPayload) { // not the case for 4letterword
+                        readPayload();
+                    }
+                    else {
+                        // four letter words take care
+                        // need not do anything else
+                        return;
+                    }
+                }
+            }
+{% endhighlight %}
+我们可以看到，读取的时候我们有两个bytebuffer,一个是lenBuffer（4个字节，代码读取request的长度），一个则是incomingBuffer(代表真正的request,长度为lenBuffer里面读取的长度)，首先把内容读取到incomingBuffer中，与lenBuffer进行比较，如果相等的话，说明这次读取是在读取request的长度，然后调用readLength()函数：
+{% highlight java %}
+/** Reads the first 4 bytes of lenBuffer, which could be true length or
+ *  four letter word.
+ *
+ * @param k selection key
+ * @return true if length read, otw false (wasn't really the length)
+ * @throws IOException if buffer size exceeds maxBuffer size
+ */
+ private boolean readLength(SelectionKey k) throws IOException {
+         // Read the length, now get the buffer
+         int len = lenBuffer.getInt();
+         if (!initialized && checkFourLetterWord(sk, len)) {
+             return false;
+         }
+         if (len < 0 || len > BinaryInputArchive.maxBuffer) {
+             throw new IOException("Len error " + len);
+         }
+         if (!isZKServerRunning()) {
+             throw new IOException("ZooKeeperServer not running");
+         }
+         incomingBuffer = ByteBuffer.allocate(len);
+         return true;
+     }
+{% endhighlight %}
+该实现中可以暂时忽略fourLetterWord相关的代码(客户端可以发送[4个字母](https://zookeeper.apache.org/doc/r3.4.8/zookeeperAdmin.html#sc_zkCommands)的命令，这样的命令不需要接着读取内容)，先把lenBuffer的内容读取出来为int，当成接下来request的长度，然后分配len长度的bytebuffer给incomingBuffer.
+接下来就是真正的读取request内容啦：
+{% highlight java %}
+/** Read the request payload (everything following the length prefix) */
+private void readPayload() throws IOException, InterruptedException {
+    if (incomingBuffer.remaining() != 0) { // have we read length bytes?
+        int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
+        if (rc < 0) {
+            throw new EndOfStreamException(
+                    "Unable to read additional data from client sessionid 0x"
+                    + Long.toHexString(sessionId)
+                    + ", likely client has closed socket");
+        }
+    }
+
+    if (incomingBuffer.remaining() == 0) { // have we read length bytes?
+        packetReceived();
+        incomingBuffer.flip();
+        if (!initialized) {
+            readConnectRequest();
+        } else {
+            readRequest();
+        }
+        lenBuffer.clear();
+        incomingBuffer = lenBuffer;
+    }
+}
+{% endhighlight %}
+当incomingBuffer.remaining()为0的时候，则代表把整个request都读取完毕，那么大多数情况下会调用readRequest(如何还没初始化完，则调用readConnectRequest)，然后又会把incomingBuffer设置为lenBuffer，则下一次读取一开始还是读取request的长度。
+{% highlight java %}
+private void readRequest() throws IOException {
+        zkServer.processPacket(this, incomingBuffer);
+    }
+{% endhighlight %}
+
+readRequest函数则是调用的zookeeper server的processPacket函数，对该request进行处理，怎么处理请求之后的博客会具体分析。
+
+如此我们已经将读取请求的代码分析完毕，接下来来看可写情况下的代码。
+{% highlight java %}
+private final Queue<ByteBuffer> outgoingBuffers =
+        new LinkedBlockingQueue<ByteBuffer>();
+    void handleWrite(SelectionKey k) throws IOException, CloseRequestException {
+        if (outgoingBuffers.isEmpty()) {
+            return;
+        }
+
+        /*
+         * This is going to reset the buffer position to 0 and the
+         * limit to the size of the buffer, so that we can fill it
+         * with data from the non-direct buffers that we need to
+         * send.
+         */
+        ByteBuffer directBuffer = NIOServerCnxnFactory.getDirectBuffer();
+        if (directBuffer == null) {
+            ByteBuffer[] bufferList = new ByteBuffer[outgoingBuffers.size()];
+            // Use gathered write call. This updates the positions of the
+            // byte buffers to reflect the bytes that were written out.
+            sock.write(outgoingBuffers.toArray(bufferList));
+
+            // Remove the buffers that we have sent
+            ByteBuffer bb;
+            while ((bb = outgoingBuffers.peek()) != null) {
+                if (bb == ServerCnxnFactory.closeConn) {
+                    throw new CloseRequestException("close requested");
+                }
+                if (bb.remaining() > 0) {
+                    break;
+                }
+                packetSent();
+                outgoingBuffers.remove();
+            }
+         } else {
+            directBuffer.clear();
+
+            for (ByteBuffer b : outgoingBuffers) {
+                if (directBuffer.remaining() < b.remaining()) {
+                    /*
+                     * When we call put later, if the directBuffer is to
+                     * small to hold everything, nothing will be copied,
+                     * so we've got to slice the buffer if it's too big.
+                     */
+                    b = (ByteBuffer) b.slice().limit(
+                            directBuffer.remaining());
+                }
+                /*
+                 * put() is going to modify the positions of both
+                 * buffers, put we don't want to change the position of
+                 * the source buffers (we'll do that after the send, if
+                 * needed), so we save and reset the position after the
+                 * copy
+                 */
+                int p = b.position();
+                directBuffer.put(b);
+                b.position(p);
+                if (directBuffer.remaining() == 0) {
+                    break;
+                }
+            }
+            /*
+             * Do the flip: limit becomes position, position gets set to
+             * 0. This sets us up for the write.
+             */
+            directBuffer.flip();
+
+            int sent = sock.write(directBuffer);
+
+            ByteBuffer bb;
+
+            // Remove the buffers that we have sent
+            while ((bb = outgoingBuffers.peek()) != null) {
+                if (bb == ServerCnxnFactory.closeConn) {
+                    throw new CloseRequestException("close requested");
+                }
+                if (sent < bb.remaining()) {
+                    /*
+                     * We only partially sent this buffer, so we update
+                     * the position and exit the loop.
+                     */
+                    bb.position(bb.position() + sent);
+                    break;
+                }
+                packetSent();
+                /* We've sent the whole buffer, so drop the buffer */
+                sent -= bb.remaining();
+                outgoingBuffers.remove();
+            }
+        }
+    }
+{% endhighlight %}
+outgoingBuffers是一个队列，里面保存着所有需要写出的内容。
+handleWrite函数略长，我们可以一块一块的来分析。
+{% highlight java %}
+ByteBuffer directBuffer = NIOServerCnxnFactory.getDirectBuffer();
+if (directBuffer == null) {
+ ByteBuffer[] bufferList = new ByteBuffer[outgoingBuffers.size()];
+ // Use gathered write call. This updates the positions of the
+ // byte buffers to reflect the bytes that were written out.
+ sock.write(outgoingBuffers.toArray(bufferList));
+
+ // Remove the buffers that we have sent
+ ByteBuffer bb;
+ while ((bb = outgoingBuffers.peek()) != null) {
+  if (bb == ServerCnxnFactory.closeConn) {
+   throw new CloseRequestException("close requested");
+  }
+  if (bb.remaining() > 0) {
+   break;
+  }
+  packetSent();
+  outgoingBuffers.remove();
+ }
+}
+{% endhighlight %}
+如果说没有directBuffer，则直接将queue中的内容转成数组，通过sock.write()将数据发送出去，然后将已经完全发送的数据从queue中删除。
+如果说存在directBuffer, 则进行如下的处理：
+{% highlight java %}
+directBuffer.clear();
+
+for (ByteBuffer b : outgoingBuffers) {
+    if (directBuffer.remaining() < b.remaining()) {
+        /*
+         * When we call put later, if the directBuffer is to
+         * small to hold everything, nothing will be copied,
+         * so we've got to slice the buffer if it's too big.
+         */
+        b = (ByteBuffer) b.slice().limit(
+                directBuffer.remaining());
+    }
+    /*
+     * put() is going to modify the positions of both
+     * buffers, put we don't want to change the position of
+     * the source buffers (we'll do that after the send, if
+     * needed), so we save and reset the position after the
+     * copy
+     */
+    int p = b.position();
+    directBuffer.put(b);
+    b.position(p);
+    if (directBuffer.remaining() == 0) {
+        break;
+    }
+}
+/*
+ * Do the flip: limit becomes position, position gets set to
+ * 0. This sets us up for the write.
+ */
+directBuffer.flip();
+
+int sent = sock.write(directBuffer);
+
+ByteBuffer bb;
+
+// Remove the buffers that we have sent
+while ((bb = outgoingBuffers.peek()) != null) {
+    if (bb == ServerCnxnFactory.closeConn) {
+        throw new CloseRequestException("close requested");
+    }
+    if (sent < bb.remaining()) {
+        /*
+         * We only partially sent this buffer, so we update
+         * the position and exit the loop.
+         */
+        bb.position(bb.position() + sent);
+        break;
+    }
+    packetSent();
+    /* We've sent the whole buffer, so drop the buffer */
+    sent -= bb.remaining();
+    outgoingBuffers.remove();
+}
+{% endhighlight %}
+首先是遍历outgoingBuffers,尽可能的把内容写到directbuffer中（若在放其中一个的时候，directbuffer容量不够，则把当前的bytebuffer进行切割，把能放进去的内容先放进去），然后还是调用sock.write来进行发送，最后的while()循环则同样的把发送的bytebuffer从outgoingBuffers中删除，同时做一些packerSent的类似数据统计工作。
+
+这边为什么有directBuffer和non directBuffer（也就是HeapByteBuffer）的两种实现呢, directBuffer相对来说性能更加好，省去了临时buffer的拷贝开销（具体见[directBuffer知乎讨论](https://www.zhihu.com/question/60892134)），但是Java对象在Java堆里申请内存的时候，实际上是比malloc要快的，所以DirectBuffer的创建效率往往是比Heap Buffer差的。具体到底用哪个取决于zookeeper的配置：
+{% highlight java %}
+/**
+ * Value of 0 disables use of direct buffers and instead uses
+ * gathered write call.
+ *
+ * Default to using 64k direct buffers.
+ */
+directBufferBytes = Integer.getInteger(
+    ZOOKEEPER_NIO_DIRECT_BUFFER_BYTES, 64 * 1024);
+{% endhighlight %}
+默认使用64k的direct buffer，但如果配置为0,则将使用HeapByteBuffer.
+
+好了，服务端怎么进行数据通信就分析到这，接下来就是看服务端具体如何处理请求了。

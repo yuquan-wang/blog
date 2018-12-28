@@ -1,0 +1,210 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(1)-客户端通信"
+date:   2018-12-24 11:49:45 +0200
+categories: ZooKeeper 源码
+---
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
+
+关于客户端通信方面，我们主要需要关注如下几个类(均在目录/src/java/main/org/apache/zookeeper下面)：
+
++ Zookeeper: 客户端的Zookeeper类
++ ClientCnxn: 客户端用来管理和服务器进行通信的类
++ ClientCnxnSocket: 客户端Socket通信的抽象
++ ClientCnxnSocketNIO: 客户端Socket通信的具体实现（原生的NIO实现）
+
+首先来看客户端Zookeeper的实例化过程，构造函数有很多个， 我们选择最核心的那个来分析：
+{% highlight java %}
+public ZooKeeper(String connectString, int sessionTimeout, Watcher watcher,
+            boolean canBeReadOnly, HostProvider aHostProvider,
+            ZKClientConfig clientConfig) throws IOException {
+        LOG.info("Initiating client connection, connectString=" + connectString
+                + " sessionTimeout=" + sessionTimeout + " watcher=" + watcher);
+
+        if (clientConfig == null) {
+            clientConfig = new ZKClientConfig();
+        }
+        this.clientConfig = clientConfig;
+        watchManager = defaultWatchManager();
+        watchManager.defaultWatcher = watcher;
+        ConnectStringParser connectStringParser = new ConnectStringParser(
+                connectString);
+        hostProvider = aHostProvider;
+
+        cnxn = new ClientCnxn(connectStringParser.getChrootPath(),
+                hostProvider, sessionTimeout, this, watchManager,
+                getClientCnxnSocket(), canBeReadOnly);
+        cnxn.start();
+    }
+{% endhighlight %}
+我们可以看到， zookeeper的实例化过程主要是传入一些参数，例如connectString告诉客户端server在哪里，然后构建一个ClientCnxn， 这个是用来管理客户端和服务端的通信过程的，然后start这个管理类。
+
+要注意的是，ClientCnxn有两个重要的成员变量：
+{% highlight java %}
+/**
+ * These are the packets that have been sent and are waiting for a response.
+ */
+private final LinkedList < Packet > pendingQueue = new LinkedList < Packet > ();
+
+/**
+ * These are the packets that need to be sent.
+ */
+private final LinkedBlockingDeque < Packet > outgoingQueue = new LinkedBlockingDeque < Packet > ();
+{% endhighlight %}
+其中outgoingQueue用来保存需要发送给服务端的请求，而pendingQueue则用来保存已经发送给服务端但是还没得到回复的请求。
+
+我们来看在start()函数中做了些什么：
+{% highlight java %}
+public void start() {
+    sendThread.start();
+    eventThread.start();
+}
+{% endhighlight %}
+在start()函数中，主要启动了两个线程,sendThread和eventThread,前者负责把各个请求发送给服务端，后者则用来处理各种事件。
+我们主要来看sendThread:
+{% highlight java %}
+class SendThread extends ZooKeeperThread {
+    private final ClientCnxnSocket clientCnxnSocket;
+    @Override
+    public void run() {}
+}
+{% endhighlight %}
+SendThread继承了ZooKeerperThread,其最主要的一个成员变量为clientCnxnSocket,用来具体和服务端通信，启动sendThread线程之后则会进入线程的run()函数。
+{% highlight java %}
+public void run() {
+        //初始化一些配置
+        while (state.isAlive()) {
+            try {
+                if (!clientCnxnSocket.isConnected()) {
+                    //如果还没和服务端连上
+                }
+                //sasl验证
+                //必要时候发送心跳信息
+                clientCnxnSocket.doTransport(to, pendingQueue, ClientCnxn.this);
+            } catch (Throwable e) {
+                //异常处理
+            }
+        }
+        //结尾工作
+    }
+{% endhighlight %}
+sendThread的run()函数的大致流程如上所述，最主要的函数的doTransport()函数，真正负责将请求包发送给服务端。
+{% highlight java %}
+@Override
+void doTransport(int waitTimeOut, List < Packet > pendingQueue, ClientCnxn cnxn)
+throws IOException, InterruptedException {
+ selector.select(waitTimeOut);
+ Set < SelectionKey > selected;
+ synchronized(this) {
+  selected = selector.selectedKeys();
+ }
+ // Everything below and until we get back to the select is
+ // non blocking, so time is effectively a constant. That is
+ // Why we just have to do this once, here
+ updateNow();
+ for (SelectionKey k: selected) {
+  SocketChannel sc = ((SocketChannel) k.channel());
+  if ((k.readyOps() & SelectionKey.OP_CONNECT) != 0) {
+   if (sc.finishConnect()) {
+    updateLastSendAndHeard();
+    updateSocketAddresses();
+    sendThread.primeConnection();
+   }
+  } else if ((k.readyOps() & (SelectionKey.OP_READ | SelectionKey.OP_WRITE)) != 0) {
+   doIO(pendingQueue, cnxn);
+  }
+ }
+ if (sendThread.getZkState().isConnected()) {
+  if (findSendablePacket(outgoingQueue,
+    sendThread.tunnelAuthInProgress()) != null) {
+   enableWrite();
+  }
+ }
+ selected.clear();
+}
+{% endhighlight %}
+
+可以看到，具体实现中用到了Java NIO 中的Selector, 用单线程处理多个channels. 用select()函数来获取各个channel的可读可写可连接情况，然后遍历各个channel,如果是可连接，则处理客户端和服务端的连接情况，如果是可读或者可写，则调用doIO()函数。
+doIO()函数略长，我们把该函数拆分成主要的两个函数，一个是可读情况下的处理，一个是可写情况下的处理。
+{% highlight java %}
+if (sockKey.isReadable()) {
+ int rc = sock.read(incomingBuffer); //先把内容读取到incommingBuffer里
+ if (rc < 0) {
+  throw new EndOfStreamException(
+   "Unable to read additional data from server sessionid 0x" +
+   Long.toHexString(sessionId) +
+   ", likely server has closed socket");
+ }
+ if (!incomingBuffer.hasRemaining()) {
+  incomingBuffer.flip();
+  if (incomingBuffer == lenBuffer) { //如果读取的是长度
+   recvCount++;
+   readLength(); //读取固定长度的内容
+  } else if (!initialized) { //如果还没初始化结束
+   readConnectResult(); //读取连接结果
+   enableRead(); //注册读事件
+   if (findSendablePacket(outgoingQueue,
+     sendThread.tunnelAuthInProgress()) != null) {
+    // Since SASL authentication has completed (if client is configured to do so),
+    // outgoing packets waiting in the outgoingQueue can now be sent.
+    enableWrite(); //如果有请求需要发送,注册写事件
+   }
+   lenBuffer.clear();
+   incomingBuffer = lenBuffer;
+   updateLastHeard();
+   initialized = true;
+  } else {
+   sendThread.readResponse(incomingBuffer); //处理从服务端得到的回复
+   lenBuffer.clear();
+   incomingBuffer = lenBuffer; //下次还是先读取长度
+   updateLastHeard();
+  }
+ }
+}
+
+{% endhighlight %}
+主要逻辑已经标注在代码中，要注意的是，实现中有两个buffer，一个是lenBuffer,固定长度4个字节，声明如下所示，用来读取内容长度，还有一个是incomingBuffer，则根据读取的长度来确定大小，然后读取回复内容。
+{% highlight java %}
+/**
+ * This buffer is only used to read the length of the incoming message.
+ */
+protected final ByteBuffer lenBuffer = ByteBuffer.allocateDirect(4);
+{% endhighlight %}
+下面来看可写的情况。
+{% highlight java %}
+if (sockKey.isWritable()) {
+    //首先找到一个需要发送的请求
+    Packet p = findSendablePacket(outgoingQueue,
+            sendThread.tunnelAuthInProgress());
+
+    if (p != null) {
+        updateLastSend();
+        // If we already started writing p, p.bb will already exist
+        if (p.bb == null) {
+            if ((p.requestHeader != null) &&
+                    (p.requestHeader.getType() != OpCode.ping) &&
+                    (p.requestHeader.getType() != OpCode.auth)) {
+                p.requestHeader.setXid(cnxn.getXid());
+            }
+            p.createBB();//序列化请求内容
+        }
+        sock.write(p.bb);//发送请求内容
+        if (!p.bb.hasRemaining()) {
+            sentCount++;
+            outgoingQueue.removeFirstOccurrence(p);//从ourgoingQueue移调掉请求
+            if (p.requestHeader != null
+                    && p.requestHeader.getType() != OpCode.ping
+                    && p.requestHeader.getType() != OpCode.auth) {
+                synchronized (pendingQueue) {
+                    pendingQueue.add(p);//讲该请求放进pendingQueue里
+                }
+            }
+        }
+    }
+ }
+{% endhighlight %}
+可写的情况下，具体逻辑已经标在代码中。主要就是从outgoingQueue里取出一个，然后进行发送。
+
+ClientCnxnSocketNIO是ClientCnxnSocket的一个Java NIO实现，ZooKeeper也提供了一个基于Netty的实现，叫ClientCnxnSocketNetty,这里就不具体分析了，功能和ClientCnxnSocketNIO一毛一样。

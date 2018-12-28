@@ -1,0 +1,166 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(2)-客户端同步异步api"
+date:   2018-12-25 11:49:45 +0200
+categories: ZooKeeper 源码
+---
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
+
+ZooKeerper提供了同步和异步两种方式来和服务端通信，我们首先看一下如何利用同步API在ZooKeeper创建节点:
+{% highlight java %}
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
+import java.io.IOException;
+
+public class SyncApiTest {
+ public static void main(String[] args) throws IOException, KeeperException, InterruptedException {
+  ZooKeeper zooKeeper = new ZooKeeper("localhost:2181", 5000, null);
+  System.out.println("Start creating node for sync1 at time " + System.currentTimeMillis());
+  zooKeeper.create("/zk-test-sync1", "".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+  System.out.println("Finish creating node for sync1 at time " + System.currentTimeMillis());
+ }
+}
+{% endhighlight %}
+
+非常简单的一个示例，在ZooKeeper中创建一个节点，下面是运行该程序的输出：
+{% highlight shell %}
+Start creating node for sync1 at time 1533276444422
+Finish creating node for sync1 at time 1533276444476
+{% endhighlight %}
+可以看到，调用同步方法创建一个节点大概花费50毫秒左右。
+接下来是一个利用异步api来创建节点的示例：
+{% highlight java %}
+import org.apache.zookeeper.*;
+
+import java.io.IOException;
+
+public class AsyncApiTest {
+
+    public static void main(String[] args) throws IOException, KeeperException, InterruptedException {
+        ZooKeeper zooKeeper = new ZooKeeper("localhost:2181", 5000, null);
+
+        System.out.println("Start creating node for sync1 at time " + System.currentTimeMillis());
+        zooKeeper.create("/zk-test-async1", "".getBytes(), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT, new IStringCallback(), "context1");
+        System.out.println("Finish call to create node for sync1 at time " + System.currentTimeMillis());
+        Thread.sleep(10000); // sleep for ten seconds
+    }
+}
+
+class IStringCallback implements AsyncCallback.StringCallback {
+
+    @Override
+    public void processResult(int rc, String path, Object ctx, String name) {
+        System.out.println("Finish creating node for " + path + " at time " + System.currentTimeMillis());
+    }
+}
+{% endhighlight %}
+运行上面的程序，得到如下输出：
+{% highlight shell %}
+Start creating node for sync1 at time 1533276563101
+Finish call to create node for sync1 at time 1533276563149
+Finish creating node for /zk-test-async1 at time 1533276563163
+{% endhighlight %}
+
+我们可以看到，程序先是立马返回执行下一句的输出，然后再是调用回调函数中的输出，这样确实就达到了异步调用的功效。
+
+那么接下来我们从源码的方式来解读一下上面的行为，首先是同步api的内部机制：
+
+同步create函数的具体实现如下：
+{% highlight java %}
+public String create(final String path, byte data[], List<ACL> acl,
+            CreateMode createMode)
+        throws KeeperException, InterruptedException
+    {
+        final String clientPath = path;
+        PathUtils.validatePath(clientPath, createMode.isSequential());
+
+        final String serverPath = prependChroot(clientPath);
+
+        RequestHeader h = new RequestHeader();
+        h.setType(ZooDefs.OpCode.create);
+        CreateRequest request = new CreateRequest();
+        CreateResponse response = new CreateResponse();
+        request.setData(data);
+        request.setFlags(createMode.toFlag());
+        request.setPath(serverPath);
+        if (acl != null && acl.size() == 0) {
+            throw new KeeperException.InvalidACLException();
+        }
+        request.setAcl(acl);
+        ReplyHeader r = cnxn.submitRequest(h, request, response, null);
+        if (r.getErr() != 0) {
+            throw KeeperException.create(KeeperException.Code.get(r.getErr()),
+                    clientPath);
+        }
+        if (cnxn.chrootPath == null) {
+            return response.getPath();
+        } else {
+            return response.getPath().substring(cnxn.chrootPath.length());
+        }
+    }
+{% endhighlight %}
+实现中主要先构建一个CreateRequest，然后依靠cnxn.submitRequest()得到回复，在根据回复内容设置response,name重点就在于submitRequest里面的实现了，来看具体代码：
+{% highlight java %}
+public ReplyHeader submitRequest(RequestHeader h, Record request,
+            Record response, WatchRegistration watchRegistration)
+            throws InterruptedException {
+        ReplyHeader r = new ReplyHeader();
+        Packet packet = queuePacket(h, r, request, response, null, null, null,
+                    null, watchRegistration);
+        synchronized (packet) {
+            while (!packet.finished) {
+                packet.wait();
+            }
+        }
+        return r;
+    }
+{% endhighlight %}
+可以看到，其实里面是有个死循环在的，如果还没结束的话，是需要一直等着的（其实内部都是把packet放早queue里，如源码阅读(1)里所示），那么什么时候packet.wait()函数会结束呢？
+{% highlight java %}
+private void finishPacket(Packet p) {
+        if (p.watchRegistration != null) {
+            p.watchRegistration.register(p.replyHeader.getErr());
+        }
+
+        if (p.cb == null) {
+            synchronized (p) {
+                p.finished = true;
+                p.notifyAll();
+            }
+        } else {
+            p.finished = true;
+            eventThread.queuePacket(p);
+        }
+    }
+{% endhighlight %}
+当我们真正结束这个packet的时候，会调用finishPacket函数，在该函数里面，因为同步create的callback为null,所以会调用该packet的notifyAll()函数，从而packet.wait()会结束，然后返回结果。
+
+我们再来看异步create函数的具体实现：
+{% highlight java %}
+public void create(final String path, byte data[], List<ACL> acl,
+            CreateMode createMode,  StringCallback cb, Object ctx)
+    {
+        final String clientPath = path;
+        PathUtils.validatePath(clientPath, createMode.isSequential());
+
+        final String serverPath = prependChroot(clientPath);
+
+        RequestHeader h = new RequestHeader();
+        h.setType(ZooDefs.OpCode.create);
+        CreateRequest request = new CreateRequest();
+        CreateResponse response = new CreateResponse();
+        ReplyHeader r = new ReplyHeader();
+        request.setData(data);
+        request.setFlags(createMode.toFlag());
+        request.setPath(serverPath);
+        request.setAcl(acl);
+        cnxn.queuePacket(h, r, request, response, cb, clientPath,
+                serverPath, ctx, null);
+    }
+{% endhighlight %}
+可以看到，总体是类似的，只不过该实现并没有调用submitRequest()，而是直接调用queuePacket()把请求放到请求队列里了，然后该函数就返回了。
+当这个packet结束处理的时候，同样会调用finishPacket()，这时候callback不为null, 系统就会调用eventThread.queuePacket(p); 把callback当成一个event去处理，这样就是异步处理了。
