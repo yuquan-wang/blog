@@ -4,6 +4,8 @@ title:  "ZooKeeper源码阅读(2)-客户端同步异步api"
 date:   2018-12-25 11:49:45 +0200
 categories: ZooKeeper 源码
 ---
+本文接着上文来分析zookeeper客户端方面的接口。
+
 ZooKeerper提供了同步和异步两种方式来和服务端通信，我们首先看一下如何利用同步API在ZooKeeper创建节点:
 {% highlight java %}
 import org.apache.zookeeper.CreateMode;
