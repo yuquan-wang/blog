@@ -4,10 +4,6 @@ title:  "ZooKeeper源码阅读(2)-客户端同步异步api"
 date:   2018-12-25 11:49:45 +0200
 categories: ZooKeeper 源码
 ---
-ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
-
-参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
-
 ZooKeerper提供了同步和异步两种方式来和服务端通信，我们首先看一下如何利用同步API在ZooKeeper创建节点:
 {% highlight java %}
 import org.apache.zookeeper.CreateMode;
@@ -164,3 +160,8 @@ public void create(final String path, byte data[], List<ACL> acl,
 {% endhighlight %}
 可以看到，总体是类似的，只不过该实现并没有调用submitRequest()，而是直接调用queuePacket()把请求放到请求队列里了，然后该函数就返回了。
 当这个packet结束处理的时候，同样会调用finishPacket()，这时候callback不为null, 系统就会调用eventThread.queuePacket(p); 把callback当成一个event去处理，这样就是异步处理了。
+
+
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》

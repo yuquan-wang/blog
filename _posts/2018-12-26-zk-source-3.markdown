@@ -4,10 +4,6 @@ title:  "ZooKeeper源码阅读(3)-服务端单机启动"
 date:   2018-12-26 11:49:45 +0200
 categories: ZooKeeper 源码
 ---
-ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
-
-参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
-
 前面两篇文章讲述了客户端方面的源码，接下来来看服务端的代码，服务端代码众多，故打算先从服务端单机启动开始遍历整个流程，搞清服务端通信过程，再研究服务端集群代码。。。。
 
 服务端单机启动的整体流程如题所示，图为参考书籍中截图：
@@ -119,3 +115,7 @@ public synchronized void startup() {
 在该函数中，首先会创建并启动一个会话处理器，然后设置一系列责任链处理器，接下来是注册JMX(Java Management Extensions)服务,然后将状态设置为running,完成服务器启动。
 
 这篇文章只是过一下ZooKeeper服务器单机启动的整个流程，很多细节会在后面的文章中一一叙述。
+
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
