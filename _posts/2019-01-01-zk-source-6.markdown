@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  "ZooKeeper源码阅读(6)-服务端通处理请求（责任链模式）"
+title:  "ZooKeeper源码阅读(6)-服务端处理请求（责任链模式）"
 date:   2019-01-01 02:49:45 +0200
 categories: ZooKeeper 源码
 ---
