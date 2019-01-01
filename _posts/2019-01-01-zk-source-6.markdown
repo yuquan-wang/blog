@@ -1,0 +1,312 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(6)-服务端通处理请求（责任链模式）"
+date:   2019-01-01 02:49:45 +0200
+categories: ZooKeeper 源码
+---
+上篇博客介绍了NIOServerCnxn是如何做真正的数据传输的，本文将探索数据传输之后，ZooKeeper是如何处理请求的。
+
+我们已经分析到如下的代码，具体在函数processPacket中便是处理请求的具体逻辑。
+{% highlight java %}
+private void readRequest() throws IOException {
+    zkServer.processPacket(this, incomingBuffer);
+}
+{% endhighlight %}
+具体怎么处理请求的，我们可以来看一下processPacket的实现（只挑选了最重要的部分）：
+
+{% highlight java %}
+Request si = new Request(cnxn, cnxn.getSessionId(), h.getXid(),
+ h.getType(), incomingBuffer, cnxn.getAuthInfo());
+si.setOwner(ServerCnxn.me);
+// Always treat packet from the client as a possible
+// local request.
+setLocalSessionFlag(si);
+submitRequest(si);
+return;
+{% endhighlight %}
+主要是构建一个Request对象，然后调用submitRequest函数，而这个submitRequest函数也比较简单，如下（主要部分）：
+{% highlight java %}
+try {
+            touch(si.cnxn);
+            boolean validpacket = Request.isValid(si.type);
+            if (validpacket) {
+                firstProcessor.processRequest(si);
+                if (si.cnxn != null) {
+                    incInProcess();
+                }
+            } else {
+                LOG.warn("Received packet at server of unknown type " + si.type);
+                new UnimplementedRequestProcessor().processRequest(si);
+            }
+        } catch (MissingSessionException e) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Dropping request: " + e.getMessage());
+            }
+        } catch (RequestProcessorException e) {
+            LOG.error("Unable to process request:" + e.getMessage(), e);
+        }
+{% endhighlight %}
+可以看到，上面的实现主要是调用firstProcessor.processRequest来处理请求，顾名思义，firstProcessor就是第一个处理器，那么还有第二个处理器第三个处理器吗？答案是有的，这里我们就要引入一种设计模式了，成为责任链模式（Chain of Responsibility）。
+
+来看一下责任链模式的定义：
+> 责任链模式在面向对象程式设计里是一种软件设计模式，它包含了一些命令对象和一系列的处理对象。 每一个处理对象决定它能处理哪些命令对象，它也知道如何将它不能处理的命令对象传递给该链中的下一个处理对象。 该模式还描述了往该处理链的末尾添加新的处理对象的方法。
+
+可以用下图来简单阐述一下责任链是怎么工作的
+![png2]({{ site.baseurl }}/assets/img/zk/2.png){: .center-image }
+采购人员的采购单，我们可以看成是一个请求，之后的主任则是第一个处理器，副董事长是第二个处理器，董事长和董事会则是第三第四个处理器，可以看到每个处理器有他对应的处理范围，例如主要只能处理金额小于5万元的请求，如果金额大于5万元，则他需要将请求往后传，让后面的处理器来处理。
+
+下面来看一下单机模式下ZooKeeper的责任链模式，具体代码在类ZooKeeperServer中
+> This class implements a simple standalone ZooKeeperServer. It sets up the
+  following chain of RequestProcessors to process requests:
+  PrepRequestProcessor -> SyncRequestProcessor -> FinalRequestProcessor
+
+上面是ZooKeeperServer类的注释，可以看到一共有三个处理器
+1. PrepRequestProcessor
+2. SyncRequestProcessor
+3. FinalRequestProcessor
+
+具体ZooKeeperServer是如何把这几个处理器串在一起的实现是在setupRequestProcessors函数中：
+{% highlight java %}
+protected void setupRequestProcessors() {
+    RequestProcessor finalProcessor = new FinalRequestProcessor(this);
+    RequestProcessor syncProcessor = new SyncRequestProcessor(this,
+            finalProcessor);
+    ((SyncRequestProcessor)syncProcessor).start();//是单独的线程，需要start
+    firstProcessor = new PrepRequestProcessor(this, syncProcessor);
+    ((PrepRequestProcessor)firstProcessor).start();//同上
+}
+{% endhighlight %}
+需要注意的是，所有的处理器都实现了RequestProcessor接口，接口申明如下：
+{% highlight java %}
+public interface RequestProcessor {
+
+    void processRequest(Request request) throws RequestProcessorException;
+
+    void shutdown();
+}
+{% endhighlight %}
+
+所有的处理器都会实现processRequest函数，分别对应他们的职责， 下面来具体看下这三个处理器分别的职责。
+
+PrepRequestProcessor
+=====
+来看类的注释：
+> This request processor is generally at the start of a RequestProcessor
+  change. It sets up any transactions associated with requests that change the
+  state of the system. It counts on ZooKeeperServer to update
+  outstandingRequests, so that it can take into account transactions that are
+  in the queue to be applied when generating a transaction.
+
+基本上就是PrepRequestProcessor是所有请求都会经过的第一个处理器，简单来说就是做一些预处理工作：
+{% highlight java %}
+LinkedBlockingQueue<Request> submittedRequests = new LinkedBlockingQueue<Request>();
+public void processRequest(Request request) {
+    submittedRequests.add(request);
+}
+{% endhighlight %}
+处理非常简单，就是把请求加入到submittedRequests队列中， 因为该类同样继承了ZooKeeperCriticalThread类，是一个单独的线程在跑，所有其实有效的逻辑在run函数中。
+{% highlight java %}
+@Override
+    public void run() {
+        try {
+            while (true) {
+                Request request = submittedRequests.take();
+                long traceMask = ZooTrace.CLIENT_REQUEST_TRACE_MASK;
+                if (request.type == OpCode.ping) {
+                    traceMask = ZooTrace.CLIENT_PING_TRACE_MASK;
+                }
+                if (LOG.isTraceEnabled()) {
+                    ZooTrace.logRequest(LOG, traceMask, 'P', request, "");
+                }
+                if (Request.requestOfDeath == request) {
+                    break;
+                }
+                pRequest(request);
+            }
+        } catch (RequestProcessorException e) {
+            if (e.getCause() instanceof XidRolloverException) {
+                LOG.info(e.getCause().getMessage());
+            }
+            handleException(this.getName(), e);
+        } catch (Exception e) {
+            handleException(this.getName(), e);
+        }
+        LOG.info("PrepRequestProcessor exited loop!");
+    }
+{% endhighlight %}
+这是一个无限循环的函数，作用便是从submittedRequests中拿出一个请求来，然后调用pRequest函数来处理这个请求。
+pRequest函数相当的长，主要是请求类型比较多，需要一一处理，这里我们只选取部分和请求有关的代码，假设我们的请求是往ZooKeeper中新建一条路径（其对应的请求的类型为create）
+
+{% highlight java %}
+protected void pRequest(Request request) throws RequestProcessorException {
+        request.setHdr(null);
+        request.setTxn(null);
+
+        try {
+            switch (request.type) {
+            case OpCode.createContainer:
+            case OpCode.create:
+            case OpCode.create2:
+                CreateRequest create2Request = new CreateRequest();
+                pRequest2Txn(request.type, zks.getNextZxid(), request, create2Request, true);
+                break;
+            //other cases
+        } catch( all kinds of exception) {
+
+        }
+        request.zxid = zks.getZxid();
+        nextProcessor.processRequest(request);
+    }
+{% endhighlight %}
+可以看到，针对type为create的请求，ZooKeeper会为其创建一个CreateRequest对象，然后传给pRequest2Txn函数，在该函数处理完之后，最后传给nextProcessor去处理。在pRequest2Txn函数中，也是根据各个类型的请求调用不同的函数，最后对于这个create请求，我们会调用pRequest2TxnCreate函数：
+{% highlight java %}
+private void pRequest2TxnCreate(int type, Request request, Record record, boolean deserialize) throws IOException, KeeperException {
+    if (deserialize) {
+        ByteBufferInputStream.byteBuffer2Record(request.request, record);
+    }
+
+    //根据request得到对应的参数
+    int flags;
+    String path;
+    List<ACL> acl;
+    byte[] data;
+    long ttl;
+    if (type == OpCode.createTTL) {
+        CreateTTLRequest createTtlRequest = (CreateTTLRequest)record;
+        flags = createTtlRequest.getFlags();
+        path = createTtlRequest.getPath();
+        acl = createTtlRequest.getAcl();
+        data = createTtlRequest.getData();
+        ttl = createTtlRequest.getTtl();
+    } else {
+        CreateRequest createRequest = (CreateRequest)record;
+        flags = createRequest.getFlags();
+        path = createRequest.getPath();
+        acl = createRequest.getAcl();
+        data = createRequest.getData();
+        ttl = -1;
+    }
+    CreateMode createMode = CreateMode.fromFlag(flags);
+    validateCreateRequest(path, createMode, request, ttl);
+    String parentPath = validatePathForCreate(path, request.sessionId);
+
+    //ACL 检查
+    List<ACL> listACL = fixupACL(path, request.authInfo, acl);
+    ChangeRecord parentRecord = getRecordForPath(parentPath);
+
+    checkACL(zks, request.cnxn, parentRecord.acl, ZooDefs.Perms.CREATE, request.authInfo, path, listACL);
+    int parentCVersion = parentRecord.stat.getCversion();
+    if (createMode.isSequential()) {
+        path = path + String.format(Locale.ENGLISH, "%010d", parentCVersion);
+    }
+    validatePath(path, request.sessionId);
+    //检测路径是否已经存在
+    try {
+        if (getRecordForPath(path) != null) {
+            throw new KeeperException.NodeExistsException(path);
+        }
+    } catch (KeeperException.NoNodeException e) {
+        // ignore this one
+    }
+    boolean ephemeralParent = EphemeralType.get(parentRecord.stat.getEphemeralOwner()) == EphemeralType.NORMAL;
+    if (ephemeralParent) {
+        throw new KeeperException.NoChildrenForEphemeralsException(path);
+    }
+    //新节点的若干数据变化
+    int newCversion = parentRecord.stat.getCversion()+1;
+    if (type == OpCode.createContainer) {
+        request.setTxn(new CreateContainerTxn(path, data, listACL, newCversion));
+    } else if (type == OpCode.createTTL) {
+        request.setTxn(new CreateTTLTxn(path, data, listACL, newCversion, ttl));
+    } else {
+        request.setTxn(new CreateTxn(path, data, listACL, createMode.isEphemeral(),
+                newCversion));
+    }
+    StatPersisted s = new StatPersisted();
+    if (createMode.isEphemeral()) {
+        s.setEphemeralOwner(request.sessionId);
+    }
+    //父节点的数据变化
+    parentRecord = parentRecord.duplicate(request.getHdr().getZxid());
+    parentRecord.childCount++;
+    parentRecord.stat.setCversion(newCversion);
+    addChangeRecord(parentRecord);
+    addChangeRecord(new ChangeRecord(request.getHdr().getZxid(), path, s, 0, listACL));
+}
+{% endhighlight %}
+总的来说就是预处理一下该请求，设置一些参数（即假设应用了这个请求之后，各个节点的数据会如何变化，如父节点对应的孩子节点数量应该增加1），最后传递给下一个处理器。
+
+SyncRequestProcessor
+=====
+来看一下该类的注释：
+> This RequestProcessor logs requests to disk. It batches the requests to do
+  the io efficiently. The request is not passed to the next RequestProcessor
+  until its log has been synced to disk.
+
+很显然，该处理器是用来做日志的，把每个请求写到日志文件中，写完后才能交给后面的处理器处理，这样就算后面的处理器因为万一没有处理(如断电了),我们也可以通过对应的日志来进行replay. 具体的实现和PrepRequestProcessor很像，也是维护一个队列，把请求插入到队列中，然后有一个线程无限循环，不断的从队列中拿出请求，写到日志中，最后传给下一个处理器，具体就不分析了
+
+FinalRequestProcessor
+=====
+来看一下该类的注释：
+> This Request processor actually applies any transaction associated with a
+  request and services any queries. It is always at the end of a
+  RequestProcessor chain (hence the name), so it does not have a nextProcessor
+  member.
+
+顾名思义，这个就是责任链模式中的最后一个处理器了，即使在集群模式下也是一样的。与上面两个处理器不同的是，该处理器没有nextProcessor，同时也不像上面两个运行着单独的线程，该处理器的processRequest函数便是真正的逻辑实现，源码中该函数稍微有点长，主要是要根据请求的不同，产生不同的response,这里我们暂时忽略返回response的部分代码，则主要剩下以下部分：
+{% highlight java %}
+public void processRequest(Request request) {
+    ProcessTxnResult rc = null;
+    synchronized (zks.outstandingChanges) {
+        // Need to process local session requests
+        // 真正把数据变化应用到ZooKeeperServer内存中
+        rc = zks.processTxn(request);
+    }
+
+    ServerCnxn cnxn = request.cnxn;
+
+    long lastZxid = zks.getZKDatabase().getDataTreeLastProcessedZxid();
+
+    //设置response内容
+    String lastOp = "NA";
+    zks.decInProcess();
+    Code err = Code.OK;
+    Record rsp = null;
+    try {
+        switch (request.type) {
+        case OpCode.create: {
+            lastOp = "CREA";
+            rsp = new CreateResponse(rc.path);
+            err = Code.get(rc.err);
+            break;
+        }
+
+        }
+    } catch (Exception e) {
+        //handle exception
+    }
+
+    ReplyHeader hdr =
+        new ReplyHeader(request.cxid, lastZxid, err.intValue());
+
+    updateStats(request, lastOp, lastZxid);
+
+    //发送response内容
+    try {
+        cnxn.sendResponse(hdr, rsp, "response");
+        if (request.type == OpCode.closeSession) {
+            cnxn.sendCloseSession();
+        }
+    } catch (IOException e) {
+        LOG.error("FIXMSG",e);
+    }
+}
+{% endhighlight %}
+针对create请求，在FinalRequestProcessor中，最终通过zks.processTxn(request)把请求写入到内存中，然后返回相应的回复。
+
+而ZooKeeperServer 是如何实现processTxn的，ZooKeeperServer内存中是怎么表示对应的目录结构的，这些我们且听下回分解。
+
+------------------------------------
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》

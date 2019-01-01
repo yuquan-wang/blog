@@ -141,7 +141,7 @@ private void readPayload() throws IOException, InterruptedException {
     }
 }
 {% endhighlight %}
-当incomingBuffer.remaining()为0的时候，则代表把整个request都读取完毕，那么大多数情况下会调用readRequest(如何还没初始化完，则调用readConnectRequest)，然后又会把incomingBuffer设置为lenBuffer，则下一次读取一开始还是读取request的长度。
+当incomingBuffer.remaining()为0的时候，则代表把整个request都读取完毕，那么大多数情况下会调用readRequest(如果还没初始化完，则调用readConnectRequest)，然后又会把incomingBuffer设置为lenBuffer，则下一次读取一开始还是读取request的长度。
 {% highlight java %}
 private void readRequest() throws IOException {
         zkServer.processPacket(this, incomingBuffer);
@@ -341,6 +341,7 @@ directBufferBytes = Integer.getInteger(
 
 好了，服务端怎么进行数据通信就分析到这，接下来就是看服务端具体如何处理请求了。
 
+------------------------------------
 ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
 
 参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
