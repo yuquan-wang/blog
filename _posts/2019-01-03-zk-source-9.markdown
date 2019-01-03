@@ -1,0 +1,462 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(9)-Leader选举后的数据同步"
+date:   2019-01-03 03:49:45 +0900
+categories: ZooKeeper 源码
+---
+上文已经分析了ZooKeeper是如何选举leader的，本文主要分析在Leader选举出来之后，leader和follower分别做了什么，他们是怎么进行数据同步的，之后完成数据同步之后，leader才能处理之后的事务请求。
+
+首先来看如果一个实例变成了leader，它的逻辑如下：
+{% highlight java %}
+case LEADING:
+    LOG.info("LEADING");
+    try {
+        setLeader(makeLeader(logFactory));
+        leader.lead();
+        setLeader(null);
+    } catch (Exception e) {
+        LOG.warn("Unexpected exception",e);
+    } finally {
+        if (leader != null) {
+            leader.shutdown("Forcing shutdown");
+            setLeader(null);
+        }
+        updateServerState();
+    }
+{% endhighlight %}
+当一个QuorumPeer的状态变成leading之后，主要是调用leader.leader()函数，而且可以猜到这是一个无限循环的函数，因为下一句它就把leader设置为null了，也就是说它本身就不再是leader了，所以重点便是leader.lead()函数了。
+{% highlight java %}
+void lead() throws IOException, InterruptedException {
+    //更新leader选举的时间参数
+    self.end_fle = Time.currentElapsedTime();
+    long electionTimeTaken = self.end_fle - self.start_fle;
+    self.setElectionTimeTaken(electionTimeTaken);
+    ServerMetrics.ELECTION_TIME.add(electionTimeTaken);
+    LOG.info("LEADING - LEADER ELECTION TOOK - {} {}", electionTimeTaken,
+            QuorumPeer.FLE_TIME_UNIT);
+    self.start_fle = 0;
+    self.end_fle = 0;
+
+    zk.registerJMX(new LeaderBean(this, zk), self.jmxLocalPeerBean);
+
+    try {
+        self.tick.set(0);
+        zk.loadData(); //zookeeper去加载数据
+
+        leaderStateSummary = new StateSummary(self.getCurrentEpoch(), zk.getLastProcessedZxid());
+
+        // Start thread that waits for connection requests from
+        // new followers.
+        cnxAcceptor = new LearnerCnxAcceptor(); //创建cnxAcceptor线程，用来接受follower的连接，用于数据同步
+        cnxAcceptor.start();
+
+        long epoch = getEpochToPropose(self.getId(), self.getAcceptedEpoch()); //这是个阻塞函数，只有当超过一半的follower用learnerHandler调用getEpochToProcess()才会返回
+
+        zk.setZxid(ZxidUtils.makeZxid(epoch, 0));//开启新周期的zxid，由epoch和counter组成,counter从0开始算起
+
+        synchronized(this){
+            lastProposed = zk.getZxid();
+        }
+
+        newLeaderProposal.packet = new QuorumPacket(NEWLEADER, zk.getZxid(),
+               null, null); //需要给follower发送有关新leader的信息
+
+        newLeaderProposal.addQuorumVerifier(self.getQuorumVerifier()); //也要保证大部分follower能收到该信息
+        if (self.getLastSeenQuorumVerifier().getVersion() > self.getQuorumVerifier().getVersion()){
+           newLeaderProposal.addQuorumVerifier(self.getLastSeenQuorumVerifier());
+        }
+
+        // We have to get at least a majority of servers in sync with
+        // us. We do this by waiting for the NEWLEADER packet to get
+        // acknowledged
+
+         waitForEpochAck(self.getId(), leaderStateSummary); //阻塞直到超过大半的follower认可新的epoch
+         self.setCurrentEpoch(epoch);//设置新的周期
+
+         try {
+             waitForNewLeaderAck(self.getId(), zk.getZxid());//阻塞直到超过大半的follower认可新的leader
+         } catch (InterruptedException e) {
+             // exception logic(timeout for waiting for ack)
+             return;
+         }
+
+         startZkServer(); //启动zookeeper服务器
+
+        if (!System.getProperty("zookeeper.leaderServes", "yes").equals("no")) {
+            self.setZooKeeperServer(zk);
+        }
+
+        self.adminServer.setZooKeeperServer(zk);
+
+        boolean tickSkip = true;
+        // If not null then shutdown this leader
+        String shutdownMessage = null;
+
+        while (true) { //无限循环，leader需要维护和follower之间的心跳
+            synchronized (this) {
+                long start = Time.currentElapsedTime();
+                long cur = start;
+                long end = start + self.tickTime / 2;
+                while (cur < end) {
+                    wait(end - cur);
+                    cur = Time.currentElapsedTime();
+                }
+
+                if (!tickSkip) {
+                    self.tick.incrementAndGet();
+                }
+
+                // We use an instance of SyncedLearnerTracker to
+                // track synced learners to make sure we still have a
+                // quorum of current (and potentially next pending) view.
+                SyncedLearnerTracker syncedAckSet = new SyncedLearnerTracker();//用来记录有多少follewer和leader保持同步
+                syncedAckSet.addQuorumVerifier(self.getQuorumVerifier());
+                if (self.getLastSeenQuorumVerifier() != null
+                        && self.getLastSeenQuorumVerifier().getVersion() > self
+                                .getQuorumVerifier().getVersion()) {
+                    syncedAckSet.addQuorumVerifier(self
+                            .getLastSeenQuorumVerifier());
+                }
+
+                syncedAckSet.addAck(self.getId());//自己肯定同步的
+
+                for (LearnerHandler f : getLearners()) {
+                    if (f.synced()) { //检测每一个follower是不是同步,在learnerHandler里面会不断更新leader认为的超时时间
+                        syncedAckSet.addAck(f.getSid());
+                    }
+                }
+
+                // check leader running status
+                if (!this.isRunning()) {
+                    // set shutdown flag
+                    shutdownMessage = "Unexpected internal error";
+                    break;
+                }
+
+                if (!tickSkip && !syncedAckSet.hasAllQuorums()) {
+                    // Lost quorum of last committed and/or last proposed
+                    // config, set shutdown flag
+                    shutdownMessage = "Not sufficient followers synced, only synced with sids: [ "
+                            + syncedAckSet.ackSetsToString() + " ]";
+                    break;
+                }
+                tickSkip = !tickSkip;
+            }
+            for (LearnerHandler f : getLearners()) {
+                f.ping(); //发送心跳给follower
+            }
+        }
+        if (shutdownMessage != null) {
+            shutdown(shutdownMessage);
+            // leader goes in looking state
+        }
+    } finally {
+        zk.unregisterJMX(this);
+    }
+}
+{% endhighlight %}
+具体逻辑都已经加了注释，要注意的是，leader会给每个follower创建一个learnerHandler，然后通过这个learnerHandler来发送和接收消息，首先是leader会发送自己的领导者信息，阻塞直到过半的follower承认这个leader之后，leader会进入一个死循环，在该循环中主要就是保持和follower的心跳，保证过半的follower还是连着的，不然就退出循环重新选主。
+
+这个learnerHandle也是比较比较重要的概念，它是在下面的代码中被引进的：
+{% highlight java %}
+cnxAcceptor = new LearnerCnxAcceptor(); //创建cnxAcceptor线程，用来接受follower的连接，用于数据同步
+cnxAcceptor.start();
+{% endhighlight %}
+具体来看一下这个线程做了什么事：
+{% highlight java %}
+public void run() {
+    try {
+        while (!stop) {
+            Socket s = null;
+            boolean error = false;
+            try {
+                s = ss.accept();//阻塞直到有新的follower连接过来
+
+                // start with the initLimit, once the ack is processed
+                // in LearnerHandler switch to the syncLimit
+                s.setSoTimeout(self.tickTime * self.initLimit);
+                s.setTcpNoDelay(nodelay);
+
+                BufferedInputStream is = new BufferedInputStream(
+                        s.getInputStream());
+                LearnerHandler fh = new LearnerHandler(s, is, Leader.this);
+                fh.start();
+            } catch (SocketException e) {
+                // exception logic
+            }
+        }
+    } catch (Exception e) {
+        LOG.warn("Exception while accepting follower", e.getMessage());
+        handleException(this.getName(), e);
+    }
+}
+{% endhighlight %}
+逻辑很简单，无限循环，监听端口，直到有新的follower的连接过来，对每一个新的follower的连接创建一个LearnerHandler线程，然后启动该线程。
+
+我们来整理下这个概念，所有ZooKeeper实例都是一个QuorumPeer,其中一个为leader，剩下的为follower(也有可能是learner),follower也会被看到成learner，在leader和follower之间进行同步的时候，leader会给每个follower创建一个learnerHandler,用来负责两者间的点对点的信息传输。以下是类LearnerHandler的注释：
+
+> There will be an instance of this class created by the Leader for each
+  learner. All communication with a learner is handled by this
+  class.
+
+来看一下这个Handler具体做了一些什么事情， 具体逻辑已经添加注释在代码中(代码经过删减)：
+{% highlight java %}
+public void run() {
+    try {
+        //初始化input和output
+
+        QuorumPacket qp = new QuorumPacket();
+        ia.readRecord(qp, "packet");
+        if(qp.getType() != Leader.FOLLOWERINFO && qp.getType() != Leader.OBSERVERINFO){//第一个收到的信息肯定是followerinfo或者observerinfo
+            LOG.error("First packet " + qp.toString()
+                    + " is not FOLLOWERINFO or OBSERVERINFO!");
+            return;
+        }
+        //some other logic
+
+        peerLastZxid = ss.getLastZxid();
+
+        // Take any necessary action if we need to send TRUNC or DIFF
+        // startForwarding() will be called in all cases
+        boolean needSnap = syncFollower(peerLastZxid, learnerMaster); //用于follower和leader之间的数据同步，返回值用于指示需不需要snapshot文件来同步
+
+        /* if we are not truncating or sending a diff just send a snapshot */
+        if (needSnap) {
+            //发送snap消息
+        }
+
+        // Start thread that blast packets in the queue to learner
+        startSendingPackets(); //开始把队列中的数据发送给follower
+        //some other logic
+
+
+        while (true) { //不断的接收新的数据，需要发送的数据会放到队列中，由另外的线程负责发送
+            qp = new QuorumPacket();
+            ia.readRecord(qp, "packet");
+
+            long traceMask = ZooTrace.SERVER_PACKET_TRACE_MASK;
+            if (qp.getType() == Leader.PING) {
+                traceMask = ZooTrace.SERVER_PING_TRACE_MASK;
+            }
+            if (LOG.isTraceEnabled()) {
+                ZooTrace.logQuorumPacket(LOG, traceMask, 'i', qp);
+            }
+            tickOfNextAckDeadline = learnerMaster.getTickOfNextAckDeadline();
+
+
+            ByteBuffer bb;
+            long sessionId;
+            int cxid;
+            int type;
+
+            switch (qp.getType()) {
+            case Leader.ACK: //接收到ACK类别的信息
+                if (this.learnerType == LearnerType.OBSERVER) {
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("Received ACK from Observer  " + this.sid);
+                    }
+                }
+                syncLimitCheck.updateAck(qp.getZxid());
+                learnerMaster.processAck(this.sid, qp.getZxid(), sock.getLocalSocketAddress());
+                break;
+            case Leader.PING: //接收到follower的心跳信息
+                // Process the touches
+                ByteArrayInputStream bis = new ByteArrayInputStream(qp
+                        .getData());
+                DataInputStream dis = new DataInputStream(bis);
+                while (dis.available() > 0) {
+                    long sess = dis.readLong();
+                    int to = dis.readInt();
+                    learnerMaster.touch(sess, to);
+                }
+                break;
+            case Leader.REVALIDATE:
+                learnerMaster.revalidateSession(qp, this);
+                break;
+            case Leader.REQUEST: //follower发送过来的请求
+                bb = ByteBuffer.wrap(qp.getData());
+                sessionId = bb.getLong();
+                cxid = bb.getInt();
+                type = bb.getInt();
+                bb = bb.slice();
+                Request si;
+                if(type == OpCode.sync){ //如果这个一个数据同步请求
+                    si = new LearnerSyncRequest(this, sessionId, cxid, type, bb, qp.getAuthinfo());
+                } else {
+                    si = new Request(null, sessionId, cxid, type, bb, qp.getAuthinfo());
+                }
+                si.setOwner(this);
+                learnerMaster.submitLearnerRequest(si); //最后调用zk.submitLearnerRequest(si);来处理，处理完就发送回follower
+                break;
+            default:
+                LOG.warn("unexpected quorum packet, type: {}", packetToString(qp));
+                break;
+            }
+        }
+    } catch (Exception e) {
+        //exception logic
+    }
+}
+{% endhighlight %}
+其中的逻辑也不是很复杂，主要是一开始帮助follower确认这个leader的信息，然后通过一个死循环不断读取来自follower的请求，并根据请求的不同做不同的处理。 同时它也有另外一个线程专门负责发送消息给follower,该线程专门从一个队列中读取消息再进行发送，实现如下。
+{% highlight java %}
+protected void startSendingPackets() {
+        if (!sendingThreadStarted) {
+            // Start sending packets
+            new Thread() {
+                public void run() {
+                    Thread.currentThread().setName(
+                            "Sender-" + sock.getRemoteSocketAddress());
+                    try {
+                        sendPackets();
+                    } catch (InterruptedException e) {
+                        LOG.warn("Unexpected interruption " + e.getMessage());
+                    }
+                }
+            }.start();
+            sendingThreadStarted = true;
+        } else {
+            LOG.error("Attempting to start sending thread after it already started");
+        }
+    }
+
+    private void sendPackets() throws InterruptedException {
+            long traceMask = ZooTrace.SERVER_PACKET_TRACE_MASK;
+            while (true) {
+                try {
+                    QuorumPacket p;
+                    p = queuedPackets.poll();
+                    if (p == null) {
+                        bufferedOutput.flush();
+                        p = queuedPackets.take();
+                    }
+
+                    if (p == proposalOfDeath) {
+                        // Packet of death!
+                        break;
+                    }
+                    if (p.getType() == Leader.PING) {
+                        traceMask = ZooTrace.SERVER_PING_TRACE_MASK;
+                    }
+                    if (p.getType() == Leader.PROPOSAL) {
+                        syncLimitCheck.updateProposal(p.getZxid(), System.nanoTime());
+                    }
+                    if (LOG.isTraceEnabled()) {
+                        ZooTrace.logQuorumPacket(LOG, traceMask, 'o', p);
+                    }
+                    oa.writeRecord(p, "packet");
+                } catch (IOException e) {
+                    if (!sock.isClosed()) {
+                        LOG.warn("Unexpected exception at " + this, e);
+                        try {
+                            // this will cause everything to shutdown on
+                            // this learner handler and will help notify
+                            // the learner/observer instantaneously
+                            sock.close();
+                        } catch(IOException ie) {
+                            LOG.warn("Error closing socket for handler " + this, ie);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+{% endhighlight %}
+
+这里还有一个重点就是syncFollower()函数，该函数决定了follower和leader进行数据同步的方式。具体代码不再分析，主要逻辑如下：
+1. committedLog 里面保存着Leader 端处理的最新的500个Proposal
+2. 当 Follower处理的Proposal大于 maxCommittedLog, 则 Follower 要TRUNC自己的Proposal至maxCommittedLog(Follower太新，包含若干还没有被提交的proposal)
+3. 当 Follower处理的Proposal小于 maxCommittedLog, 大于minCommittedLog, 则Leader将Follower没有的Proposal发送到Follower, 让其处理(Follower没有leader新，但没有落后那么多)
+4. 当 Follower处理的Proposal小于 minCommittedLog, 则Leader发送 Leader.SNAP给FOLLOWER, 并且将自身的数据序列化成数据流, 发送给 Follower(Follower落后太多)
+
+下面来看一下follower这边的逻辑：
+
+{% highlight java %}
+case FOLLOWING:
+ try {
+  LOG.info("FOLLOWING");
+  setFollower(makeFollower(logFactory));
+  follower.followLeader();
+ } catch (Exception e) {
+  LOG.warn("Unexpected exception", e);
+ } finally {
+  follower.shutdown();
+  setFollower(null);
+  updateServerState();
+ }
+{% endhighlight %}
+当状态变成following的时候，它主要是调用了followLeader()函数
+{% highlight java %}
+void followLeader() throws InterruptedException {
+    self.end_fle = Time.currentElapsedTime();
+    long electionTimeTaken = self.end_fle - self.start_fle;
+    self.setElectionTimeTaken(electionTimeTaken);
+    ServerMetrics.ELECTION_TIME.add(electionTimeTaken);
+    LOG.info("FOLLOWING - LEADER ELECTION TOOK - {} {}", electionTimeTaken,
+            QuorumPeer.FLE_TIME_UNIT);
+    self.start_fle = 0;
+    self.end_fle = 0;
+    fzk.registerJMX(new FollowerBean(this, zk), self.jmxLocalPeerBean);
+    try {
+        QuorumServer leaderServer = findLeader(); //首先通过投票信息找到当前的leader
+        try {
+            connectToLeader(leaderServer.addr, leaderServer.hostname);  //创建和leader的连接，learnerHandler正好会accept这个连接
+            long newEpochZxid = registerWithLeader(Leader.FOLLOWERINFO); //这里确保learnerHandler收到的第一个小时是followerinfo
+            if (self.isReconfigStateChange())
+               throw new Exception("learned about role change");
+            //check to see if the leader zxid is lower than ours
+            //this should never happen but is just a safety check
+            long newEpoch = ZxidUtils.getEpochFromZxid(newEpochZxid);
+            if (newEpoch < self.getAcceptedEpoch()) {
+                LOG.error("Proposed leader epoch " + ZxidUtils.zxidToString(newEpochZxid)
+                        + " is less than our accepted epoch " + ZxidUtils.zxidToString(self.getAcceptedEpoch()));
+                throw new IOException("Error: Epoch of leader is lower");
+            }
+            long startTime = Time.currentElapsedTime();
+            try {
+                syncWithLeader(newEpochZxid); //首先follower需要和leader进行数据同步
+            } finally {
+                long syncTime = Time.currentElapsedTime() - startTime;
+                ServerMetrics.FOLLOWER_SYNC_TIME.add(syncTime);
+            }
+            if (self.getObserverMasterPort() > 0) {
+                LOG.info("Starting ObserverMaster");
+
+                om = new ObserverMaster(self, fzk, self.getObserverMasterPort());
+                om.start();
+            } else {
+                om = null;
+            }
+            // create a reusable packet to reduce gc impact
+            QuorumPacket qp = new QuorumPacket();
+            while (this.isRunning()) {
+                readPacket(qp); //同步完就是读取来自Leader的信息
+                processPacket(qp);//然后处理这个请求
+            }
+        } catch (Exception e) {
+            LOG.warn("Exception when following the leader", e);
+            try {
+                sock.close();
+            } catch (IOException e1) {
+                e1.printStackTrace();
+            }
+
+            // clear pending revalidations
+            pendingRevalidations.clear();
+        }
+    } finally {
+        if (om != null) {
+            om.stop();
+        }
+        zk.unregisterJMX((Learner)this);
+    }
+}
+{% endhighlight %}
+具体的逻辑也已经写在注释中，主要就是先完成和leader的数据同步，然后接收leader的请求并进行处理。Follower对应的ZooKeeper实例数据同步没有结束之前，是不会启动的，这样也就保证了在启动之后它肯定是和leader保证一直的。
+
+接下来我们将分析在集群模式下的责任链模式，相较于单机模式略复杂，也就是ZooKeeper论文中提到的broadcase(广播)，即如何保证各个实例的一致性。
+
+------------------------------------
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
