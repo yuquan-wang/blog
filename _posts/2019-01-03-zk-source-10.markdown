@@ -1,0 +1,243 @@
+---
+layout: post
+title:  "ZooKeeper源码阅读(10)-集群中Leader的责任链"
+date:   2019-01-03 04:49:45 +0900
+categories: ZooKeeper 源码
+---
+上文讲解了在Leader被选举出来后，Leader和follower分别是怎么进行数据同步的，本文主要讲解leader的责任链模式，我们在之前也分析过单机版本下的责任链模式，但单机版本下的模式比较简单，因为不涉及到集群的一致性，分析的类为LeaderZooKeeperServer， 我们来看一下该类的注释：
+> Just like the standard ZooKeeperServer. We just replace the request
+  processors: PrepRequestProcessor -> ProposalRequestProcessor ->
+  CommitProcessor -> Leader.ToBeAppliedRequestProcessor ->
+  FinalRequestProcessor
+
+可以看到，责任链比单机版的长了不少，也有若干处理器是相同的，这里我们回顾一下相同的那些，然后重点分析下新出现的一些处理器
+1. PrepRequestProcessor， 所有请求的第一个处理器，做一些预处理工作
+2. FinalRequestProcessor，最后的处理器，用于将请求真正的应用到内存数据库中
+
+ProposalRequestProcessor
+=====
+> This RequestProcessor simply forwards requests to an AckRequestProcessor and
+  SyncRequestProcessor.
+
+看该类的注释可以知道，这个处理器仅仅是简单的把请求推送给AckRequestProcessor和SyncRequestProcessor
+{% highlight java %}
+public void processRequest(Request request) throws RequestProcessorException {
+    if (request instanceof LearnerSyncRequest){ //处理同步请求
+        zks.getLeader().processSync((LearnerSyncRequest)request);
+    } else {
+        nextProcessor.processRequest(request); //把请求交给下一个处理器，这里指CommitProcessor
+        if (request.getHdr() != null) { //如果是一个事务性请求
+            // We need to sync and get consensus on any transactions
+            try {
+                zks.getLeader().propose(request); //发起一个提议，等待大半follower同意
+            } catch (XidRolloverException e) {
+                throw new RequestProcessorException(e.getMessage(), e);
+            }
+            syncProcessor.processRequest(request); //和单机版一样，记录于日志
+        }
+    }
+}
+{% endhighlight %}
+具体的逻辑已经在注释中说明，这里的AckRequestProcessor也只是指leader自己同意这个proposal,可以看AckRequestProcessor是怎么处理请求的：
+{% highlight java %}
+public void processRequest(Request request) {
+    QuorumPeer self = leader.self;
+    if(self != null)
+        leader.processAck(self.getId(), request.zxid, null);
+    else
+        LOG.error("Null QuorumPeer");
+}
+{% endhighlight %}
+
+CommitProcessor
+=====
+> The CommitProcessor is multi-threaded. Communication between threads is
+  handled via queues, atomics, and wait/notifyAll synchronized on the
+  processor. The CommitProcessor acts as a gateway for allowing requests to
+  continue with the remainder of the processing pipeline. It will allow many
+  read requests but only a single write request to be in flight simultaneously,
+  thus ensuring that write requests are processed in transaction id order.
+
+这里我们可以得到若有干有用的信息
++ 该处理器是多线程的
++ 该处理器类似于网关，决定了请求能不能往之后的处理器传输，条件便是被大半的follower同意
++ 该处理器保证了事务性请求按顺序被处理
+
+{% highlight java %}
+public void processRequest(Request request) {
+    if (stopped) {
+        return;
+    }
+    if (LOG.isDebugEnabled()) {
+        LOG.debug("Processing request:: " + request);
+    }
+    queuedRequests.add(request);
+    wakeup();
+}
+{% endhighlight %}
+和其他大部分处理器类似，在处理请求的函数中，CommitProcessor也是仅仅把请求加入到请求队列中，那么重要的逻辑便在线程的run()函数里了。
+
+首先来看一下该类几个比较重要的成员变量:
+{% highlight java %}
+//所有等待处理的请求
+protected LinkedBlockingQueue<Request> queuedRequests =
+    new LinkedBlockingQueue<Request>();
+
+//所有已经被提交的请求(在被大半follower认可后才能提交)
+protected final LinkedBlockingQueue<Request> committedRequests =
+    new LinkedBlockingQueue<Request>();
+
+//key为session id, value为该会话所有请求，这样就保证了所有请求是按照顺序被处理的
+protected final Map<Long, LinkedList<Request>> pendingRequests =
+        new HashMap<Long, LinkedList<Request>>(10000);
+{% endhighlight %}
+
+再来看下该线程的run()函数的具体逻辑，已加注释：
+{% highlight java %}
+public void run() {
+    try {
+        int requestsToProcess = 0;
+        boolean commitIsWaiting = false;
+  do {
+            commitIsWaiting = !committedRequests.isEmpty(); //如果commitIsWaiting为true，则表示committedRequests这个队列非空，那么就是处于等待commit的状态了
+            requestsToProcess =  queuedRequests.size(); //有多少个请求要处理
+            // Avoid sync if we have something to do
+            if (requestsToProcess == 0 && !commitIsWaiting){ //如果没有请求需要处理
+                // Waiting for requests to process
+                synchronized (this) {
+                    while (!stopped && requestsToProcess == 0
+                            && !commitIsWaiting) {
+                        wait();
+                        commitIsWaiting = !committedRequests.isEmpty();
+                        requestsToProcess = queuedRequests.size();
+                    }
+                }
+            }
+            Request request = null;
+            while (!stopped && requestsToProcess > 0
+                    && (request = queuedRequests.poll()) != null) { //不断循环处理队列中的请求
+                requestsToProcess--;
+                if (needCommit(request)
+                        || pendingRequests.containsKey(request.sessionId)) {//如果这个请求需要commit或者pendingRequests中有这个会话的请求队列
+                    // Add request to pending
+                    LinkedList<Request> requests = pendingRequests
+                            .get(request.sessionId);
+                    if (requests == null) {
+                        requests = new LinkedList<Request>();
+                        pendingRequests.put(request.sessionId, requests);
+                    }
+                    requests.addLast(request); //将请求加入该会话的请求队列
+                }
+                else {
+                    sendToNextProcessor(request); //不需要commit的话，就直接传递给下一个处理器
+                }
+                if (!pendingRequests.isEmpty() && !committedRequests.isEmpty()){ //判断下已经有请求被commit
+                    commitIsWaiting = true;
+                    break;
+                }
+            }
+
+            // 处理当前被commit的请求
+            if (commitIsWaiting && !stopped){
+                waitForEmptyPool(); //通过wait和notifyall来做到只有一个写请求会被处理
+
+                if (stopped){
+                    return;
+                }
+
+                // Process committed head
+                if ((request = committedRequests.poll()) == null) {
+                    throw new IOException("Error: committed head is null");
+                }
+
+                /*
+                 * Check if request is pending, if so, update it with the committed info
+                 */
+                LinkedList<Request> sessionQueue = pendingRequests
+                        .get(request.sessionId); //得到该会话的请求队列
+                if (sessionQueue != null) {
+                    // If session queue != null, then it is also not empty.
+                    Request topPending = sessionQueue.poll(); //得到请求队列中的第一个请求
+                    if (request.cxid != topPending.cxid) {
+                        //we can get commit requests that are not at the queue head after a session moved (see ZOOKEEPER-2684)
+                        LOG.warn("Got request " + request +
+                                " but we are expecting request " + topPending);
+                        sessionQueue.addFirst(topPending); //放回队首
+                    } else {
+                        //对应上队首的请求
+                        topPending.setHdr(request.getHdr());
+                        topPending.setTxn(request.getTxn());
+                        topPending.zxid = request.zxid;
+                        request = topPending;
+                    }
+                }
+
+                sendToNextProcessor(request);//把请求交给下一个处理器
+
+                waitForEmptyPool();
+
+                /*
+                 * Process following reads if any, remove session queue if
+                 * empty.
+                 */
+                if (sessionQueue != null) { //处理该请求队列中接下来的连续的读请求，直接交给下一个处理器
+                    while (!stopped && !sessionQueue.isEmpty()
+                            && !needCommit(sessionQueue.peek())) {
+                        sendToNextProcessor(sessionQueue.poll());
+                    }
+                    // Remove empty queues
+                    if (sessionQueue.isEmpty()) {
+                        pendingRequests.remove(request.sessionId);
+                    }
+                }
+            }
+        } while (!stoppedMainLoop);
+    } catch (Throwable e) {
+        handleException(this.getName(), e);
+    }
+    LOG.info("CommitProcessor exited loop!");
+}
+{% endhighlight %}
+
+上述逻辑便保证了来自同一个会话的请求会被按顺序的处理，因为它们是被放在一个队列中，一个一个按顺序处理的。
+
+Leader.ToBeAppliedRequestProcessor
+=====
+> This request processor simply maintains the toBeApplied list. For
+  this to work next must be a FinalRequestProcessor and
+  FinalRequestProcessor.processRequest MUST process the request
+  synchronously!
+
+ToBeAppliedRequestProcessor是Leader的一个内部类，主要是为了维护Leader类的toBeApplied队列，这个队列中保存了已经完成投票（即commit）的proposal，但是这些proposal还没有应用到本机的内存中（这个工作是由FinalRequestProcessor来完成的）
+
+它的processRequest函数的处理逻辑如下：
+1.  先传递给FinalRequestProcessor处理，把commit的proposal应用到本机的内存中
+2.  从toBeApplied中删除对应的proposal
+
+具体代码如下
+{% highlight java %}
+public void processRequest(Request request) throws RequestProcessorException {
+            next.processRequest(request);
+
+            if (request.getHdr() != null) { //如果是个写请求
+                long zxid = request.getHdr().getZxid();
+                Iterator<Proposal> iter = leader.toBeApplied.iterator();
+                if (iter.hasNext()) {
+                    Proposal p = iter.next();
+                    if (p.request != null && p.request.zxid == zxid) {
+                        iter.remove(); //从toBeApplied中删除该请求，因为上面通过调用next.processRequest(request);已经应用这个请求了
+                        return;
+                    }
+                }
+                LOG.error("Committed request not found on toBeApplied: "
+                          + request);
+            }
+        }
+{% endhighlight %}
+
+leader的责任链便差不多就是如此，下文主要分析下follower的责任链。
+
+------------------------------------
+ZooKeeper 源码地址：[https://github.com/apache/zookeeper](https://github.com/apache/zookeeper)
+
+参考书籍：《从Paxos到Zookeeper 分布式一致性原理与实践》
