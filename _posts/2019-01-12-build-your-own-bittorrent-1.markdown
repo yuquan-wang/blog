@@ -51,15 +51,10 @@ Bencode还是比较简单的，支持4种类型，每种都有特殊的开始字
 
 具体代码如下：
 {% highlight java %}
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
 /*
     Algorithm introduction: https://en.wikipedia.org/wiki/Bencode
  */
-public class BEncoder {
+public class Bencode {
     private static final String INVALID = "Invalid input";
 
     private String data = "";
@@ -162,6 +157,8 @@ public class BEncoder {
         }
     }
 }
+
+
 {% endhighlight %}
 
 返回来要把一个对象进行encode的话就更加简单了，直接根据类型和规则进行转换即可：
