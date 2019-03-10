@@ -6,6 +6,8 @@ categories: bittorrent
 ---
 从本篇文章开始，打算写一系列文章来说明，如何从头开始实现一个bittorrent.具体代码在[build-your-own-bittorrent](https://github.com/yuquan-wang/build-your-own-bittorrent)中
 
+BitTorrent完整的协议在这里：[BitTorrent protocal specification](https://wiki.theory.org/index.php/BitTorrentSpecification),差不多这个教程就是跟着协议一步步写下来，做一个简单版本的bittorrent系统。
+
 torrent是我们经常用到的下载工具，利用torrent我们可以进行非常快速的下载，尤其我们经常会听到，越多人做种，你下载的就越快，那么它背后到底是什么原理？从本文开始，我们将逐渐揭露它背后的工作原理。
 
 第一步我们需要对torrent文件有一个认识，我从[Ubuntu官网](https://www.ubuntu.com/download/alternative-downloads)下载了Ubuntu 18.10 Desktop (64-bit)的种子，并且用文件编辑器打开，如下展示了该种子文件的前若干行：
@@ -190,6 +192,6 @@ public String encode(Object input) throws Exception {
     }
 {% endhighlight %}
 
-当然我们可以用一系列的单元测试来看看实现是否正确，在这里不加细讲，详细可以看[测试用力](https://github.com/yuquan-wang/build-your-own-bittorrent/blob/master/src/test/java/BEncoderTest.java)
+当然我们可以用一系列的单元测试来看看实现是否正确，在这里不加细讲，详细可以看[测试用例](https://github.com/yuquan-wang/build-your-own-bittorrent/blob/master/src/test/java/BEncoderTest.java)
 
 了解Bencode是最最基础的，接下来将讲解如果根据内容构建一个种子文件。
