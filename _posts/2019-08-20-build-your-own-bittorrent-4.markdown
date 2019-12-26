@@ -1,7 +1,7 @@
 ---
 layout: post
 title:  "从头写一个bittorrent(4)-TorrentClient"
-date:   2019-08-020 05:49:45 +0900
+date:   2019-08-20 05:49:45 +0900
 categories: bittorrent
 ---
 从[第一篇文章](https://yuquan-wang.github.io/blog/2019/01/11/build-your-own-bittorrent-1.html)开始，打算写一系列文章来说明，如何从头开始实现一个bittorrent.具体代码在[build-your-own-bittorrent](https://github.com/yuquan-wang/build-your-own-bittorrent)中
