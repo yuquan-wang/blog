@@ -179,3 +179,5 @@ func (db *DB) init() error {
 
 用图来表示的话就如下图所示：
 ![png1]({{ site.baseurl }}/assets/img/boltdb/db-init.png){: .center-image }
+
+下一篇文章便是学习具体每一个页面是如何布局的。
