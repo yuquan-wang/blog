@@ -164,7 +164,7 @@ func (tx *Tx) Commit() error {
 		}
 	}
 
-	// 把B+ 树分裂产生的脏页写入磁盘
+	// 把B+ 树分裂产生的脏页写入磁盘，这里其实内存中是有多个版本的B+树的
 	if err := tx.write(); err != nil {
 		tx.rollback() //写入错误则进行回滚
 		return err
