@@ -1,0 +1,128 @@
+---
+layout: post
+title:  "redis知识点整理"
+date:   2020-07-18 12:49:45 +0200
+categories: 分布式 database redis
+---
+redis是我们经常用来用来做缓存的key-value数据库，也是很多面试的常见考点(字节必考)，这篇文章主要是在阅读了《redis设计与实现(第二版)》和部分redis源码之后，对常见的知识点/考点做的一些梳理。
+
+## 首先redis是个啥？
+redis属于nosql中的key-value数据库，属于内存数据库，一般用来做缓存。
+
+## redis的竞争产品有哪些？
+一般来说和redis类似的竞争产品都是指[memCache](https://memcached.org/),也是个内存数据库。
+
+## redis和memCache的区别有哪些？
+- redis支持更多的数据结构（key肯定是string, value可以有string, list, set, zset(sorted set), hash）
+- redis是单线程的，而memCache是多线程的。
+- redis支持持久化，memCache不支持
+- redis支持主从模式，哨兵模式和集群模式，memCache一般通过mcRouter来实现集群(但跨dc同步有一些问题)
+
+## redis支持的数据结构(value)和常见操作
+- string, 键值为string类型，可以实现所有memCache的功能
+- hash， 键值为哈希类型，可以实现对象的存储和设置，如下：
+{% highlight shell %}
+-- > 127.0.0.1:6379>  HMSET runoobkey name "redis tutorial" description "redis basic commands for caching" likes 20 visitors 23000
+OK
+127.0.0.1:6379>  HGETALL runoobkey
+1) "name"
+2) "redis tutorial"
+3) "description"
+4) "redis basic commands for caching"
+5) "likes"
+6) "20"
+7) "visitors"
+8) "23000"
+{% endhighlight %}
+- list, 键值为列表类型， 是个双端列表，可以从左边或者右边插入
+{% highlight shell %}
+redis 127.0.0.1:6379> LPUSH runoobkey redis
+(integer) 1
+redis 127.0.0.1:6379> LPUSH runoobkey mongodb
+(integer) 2
+redis 127.0.0.1:6379> LPUSH runoobkey mysql
+(integer) 3
+redis 127.0.0.1:6379> LRANGE runoobkey 0 10
+1) "mysql"
+2) "mongodb"
+3) "redis"
+{% endhighlight %}
+- set，键值为集合类型，可以用来去重
+{% highlight shell %}
+redis 127.0.0.1:6379> LPUSH runoobkey redis
+(integer) 1
+redis 127.0.0.1:6379> LPUSH runoobkey mongodb
+(integer) 2
+redis 127.0.0.1:6379> LPUSH runoobkey mysql
+(integer) 3
+redis 127.0.0.1:6379> LRANGE runoobkey 0 10
+
+1) "mysql"
+2) "mongodb"
+3) "redis"
+{% endhighlight %}
+- zset(sorted set)，键值为有序的集合，即可以根据分数对集合中的数据进行排序
+{% highlight shell %}
+redis 127.0.0.1:6379> ZADD runoobkey 1 redis
+(integer) 1
+redis 127.0.0.1:6379> ZADD runoobkey 2 mongodb
+(integer) 1
+redis 127.0.0.1:6379> ZADD runoobkey 3 mysql
+(integer) 1
+redis 127.0.0.1:6379> ZADD runoobkey 3 mysql
+(integer) 0
+redis 127.0.0.1:6379> ZADD runoobkey 4 mysql
+(integer) 0
+redis 127.0.0.1:6379> ZRANGE runoobkey 0 10 WITHSCORES
+
+1) "redis"
+2) "1"
+3) "mongodb"
+4) "2"
+5) "mysql"
+6) "4"
+{% endhighlight %}
+
+
+## zset背后的实现机制
+zset一方面要支持根据分数的排序，一方面又要支持根据键来拿到对应的分数，那么实现就比较直观了：
+支持排序：插入数据的时候要做到性能最右，一般链表插入是O(1),同时需要二分查找来帮忙加速，所以背后机制是一个跳表(SkipList)
+支持根据键来拿到对应的分数：需要一个额外的hashmap来维护这个对应的关系
+来看一下源码的定义：
+{% highlight c++ %}
+typedef struct zset {
+    dict *dict; //维护key对应的分数
+    zskiplist *zsl; //跳表来加速节点的插入和查找
+} zset;
+{% endhighlight %}
+
+
+## redis为什么这么快？（面试必考题）
+- 内存数据库，所有操作都在内存进行。
+- 单线程，没有了线程之间的上下文切换操作，效率更高，这里的单线程指的是从接收网络请求到把请求放到队列到请求被处理这个流程，并不是说整个redis软件，总体来说肯定是多线程的，因为还有clean worker这样的线程同时运行着（redis 6.0版本之后开始支持多线程）
+- 非常多的细节优化
+- - 比如redis是用c写的，但是并没有直接用c的char*,而是自己定义了simple dynamic string(sds)来做优化，相比c自带的char*有很多优点，比如O(1)得到字符串长度，而strlen()需要O(n), 如sds会预留空间给string,省去多次allocate的代价
+- - 比如每种数据结构(string, list, set, hash, zset)对应至少两种底层数据结构，举个例子，有序列表zset的底层实现有两种，当数据量少的时候它会编码成ziplist,当数据量多的时候它会编码成skiplist
+- - 再比如hash表进行rehash的时候，它会把整个rehash过程分散化，进行渐进式rehash,这样在不影响性能的情况下完成rehash操作。
+
+
+## redis为什么是单线程？
+因为redis作者说单线程已经够了, redis的瓶颈在于内存和网络IO(这个是redis6.0多线程优化的点)
+
+
+## redis支持持久化吗？
+支持，并且还有两种方式。
+- 一种是rdb持久化，相当于快照
+- 另一种是aof持久化，相当于操作日志，每执行一次修改操作，都在日志中追加操作，这样redis崩溃后再重新执行一遍就能恢复，一般aof会比rdb更加频繁，所以优先级更高。
+
+
+## redis怎么处理过期的键？
+- 定时删除，创建一个定时器，在键过期后立马删除，优点是节省内存，缺点是耗cpu
+- 惰性删除，当下一次访问key的时候进行判断，如果过期了进行删除，优点是省cpu,缺点是耗内存
+- 定期删除，每隔一段时间进行一部分的删除，综合了上述的优缺点
+redis里面惰性删除和定期删除混合着用。
+
+## redis的几种集群策略？
+- 主从模式，一个主服务器和N个从服务器，从服务器slaveof主服务器，主服务器负责写，从服务器负责分担读压力，缺点在于主服务挂了系统没法保持高可用性
+- 哨兵模式， 在主从模式的基础上，增加一个在主服务器的哨兵，用来解决主服务器挂了无法保持可用性的问题，一旦主服务器挂了，哨兵会在从服务器中选择一个作为主服务器，并让其他从服务器跟随新的主服务器， 缺点在于没有可扩展性，当然可扩展性这个东西主从模式也没有。。。
+- cluster集群模式，是redis提供的分布式数据库方案，具有数据分片功能（可扩展性），同时提供复制和故障转移功能。
